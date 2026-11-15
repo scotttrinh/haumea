@@ -9,8 +9,8 @@ Conventions borrowed from the Next.js App Router:
 - ``app/(group)/about/route.py``        -> ``/about``
 
 A route module exports functions named after HTTP methods (``GET``, ``POST``,
-...). Its signature declares its inputs: path and query parameters, Pydantic
-models for the JSON body, and ``Depends`` (see ``haumea.params``).
+...). Its signature declares its inputs: path and query parameters, a
+model for the JSON body, and ``Depends`` (see ``haumea.params``).
 
 Locally, every route is served by one app (``create_app``). When
 deployed, each route is its own function running a single-route app

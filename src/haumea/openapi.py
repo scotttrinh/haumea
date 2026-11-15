@@ -6,7 +6,7 @@ import inspect
 import re
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, TypeAdapter
+import msgspec
 
 from haumea.params import Endpoint
 from haumea.responses import Response
@@ -14,7 +14,7 @@ from haumea.responses import Response
 if TYPE_CHECKING:
     from haumea.app import Haumea
 
-_REF = "#/components/schemas/{model}"
+_REF = "#/components/schemas/{name}"
 
 _VALIDATION_ERROR = {
     "description": "Validation Error",
@@ -32,11 +32,10 @@ _VALIDATION_ERROR = {
 
 
 def _schema(annotation: Any, components: dict[str, Any]) -> dict[str, Any]:
-    schema = TypeAdapter(annotation).json_schema(ref_template=_REF)
-    components.update(schema.pop("$defs", {}))
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        components[annotation.__name__] = schema
-        return {"$ref": _REF.format(model=annotation.__name__)}
+    (schema,), definitions = msgspec.json.schema_components(
+        [annotation], ref_template=_REF
+    )
+    components.update(definitions)
     return schema
 
 

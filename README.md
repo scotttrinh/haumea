@@ -4,7 +4,7 @@ A Python framework for seamless serverless usage
 
 ## Design
 
-A serverless-first Python web framework. Its handler API follows the shape FastAPI made familiar (typed signatures, Pydantic models, `Depends`, generated OpenAPI) but is built from the ground up around one-function-per-route deployments. Has native support for Vercel's [Build Outputs API](https://vercel.com/docs/build-output-api).
+A serverless-first Python web framework. Its handler API follows the shape FastAPI made familiar (typed signatures, typed models, `Depends`, generated OpenAPI) but is built from the ground up around one-function-per-route deployments. Has native support for Vercel's [Build Outputs API](https://vercel.com/docs/build-output-api).
 
 ## Usage
 
@@ -22,13 +22,15 @@ public/                           ->  static files
 
 ```python
 # app/api/items/[item_id]/route.py
+from typing import Annotated
+
 from haumea import Depends, Header, HTTPException
-from pydantic import BaseModel
+from msgspec import Meta, Struct
 
 
-class Item(BaseModel):
+class Item(Struct):
     name: str
-    price: float
+    price: Annotated[float, Meta(gt=0)]
 
 
 def current_user(authorization: str = Header()) -> str:
@@ -41,15 +43,16 @@ def GET(item_id: int, verbose: bool = False):
     return {"item_id": item_id, "verbose": verbose}
 
 
-async def PUT(item_id: int, item: Item, user: str = Depends(current_user)):
-    return {"item_id": item_id, "updated_by": user, **item.model_dump()}
+async def PUT(item_id: int, item: Item, user: str = Depends(current_user)) -> Item:
+    return item
 ```
 
-A handler's signature declares its inputs, which are validated with Pydantic
-(invalid requests get a `422`):
+A handler's signature declares its inputs, which are validated with
+[msgspec](https://jcristharif.com/msgspec/) (invalid requests get a `422`):
 
 - a parameter named after a `[segment]` comes from the path
-- a Pydantic model comes from the JSON body
+- a model (a msgspec `Struct`, dataclass or attrs class) comes from the JSON
+  body, decoded and validated in a single pass
 - `Depends(fn)` is the result of calling `fn`, whose own signature is resolved
   the same way
 - a `Request` annotation receives the raw request

@@ -49,16 +49,29 @@ def test_routes_and_parameters(client):
 def test_validation_errors(client):
     response = client("GET", "/api/items/nope")
     assert response.status_code == 422
-    [error] = response.json()["detail"]
-    assert error["loc"] == ["path", "item_id"]
-    assert error["type"] == "int_parsing"
+    assert response.json() == {
+        "detail": [{"loc": ["path", "item_id"], "msg": "Expected `int`, got `str`"}]
+    }
 
     response = client("PUT", "/api/items/7", json={"name": "x"}, headers=AUTH)
     assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "price"]
+    assert response.json()["detail"] == [
+        {"loc": ["body"], "msg": "Object missing required field `price`"}
+    ]
+
+    # Constraints declared with msgspec.Meta are enforced, with a path.
+    item = {"name": "x", "price": -1}
+    response = client("PUT", "/api/items/7", json=item, headers=AUTH)
+    assert response.json()["detail"] == [
+        {"loc": ["body", "price"], "msg": "Expected `float` > 0.0"}
+    ]
 
     response = client("PUT", "/api/items/7", content=b"{nope", headers=AUTH)
-    assert response.json()["detail"][0]["type"] == "json_invalid"
+    assert response.status_code == 422
+    assert "malformed" in response.json()["detail"][0]["msg"]
+
+    response = client("PUT", "/api/items/7", headers=AUTH)
+    assert response.json()["detail"] == [{"loc": ["body"], "msg": "Field required"}]
 
 
 def test_body_and_dependencies(client):
@@ -89,9 +102,14 @@ def test_dev_docs_and_static_files(client):
     ref = {"$ref": "#/components/schemas/Item"}
     assert put["requestBody"]["content"]["application/json"]["schema"] == ref
     assert put["responses"]["200"]["content"]["application/json"]["schema"] == ref
-    assert set(schema["components"]["schemas"]["Item"]["properties"]) == {
-        "name",
-        "price",
+    properties = schema["components"]["schemas"]["Item"]["properties"]
+    assert properties["price"] == {"type": "number", "exclusiveMinimum": 0}
+    verbose = schema["paths"]["/api/items/{item_id}"]["get"]["parameters"][1]
+    assert verbose == {
+        "name": "verbose",
+        "in": "query",
+        "required": False,
+        "schema": {"type": "boolean"},
     }
 
 
@@ -128,8 +146,8 @@ def test_build_output_layout(output):
     assert vc_config["handler"] == "vc__handler__python.vc_handler"
     assert vc_config["maxDuration"] == 10
     assert (func / "_vendor" / "haumea").is_dir()
-    assert not (func / "_vendor" / "fastapi").exists()
-    assert not (func / "_vendor" / "starlette").exists()
+    assert (func / "_vendor" / "msgspec").is_dir()
+    assert not (func / "_vendor" / "pydantic").exists()
     assert not (func / "public").exists()
 
     hello_config = (functions / "api" / "hello.func" / ".vc-config.json").read_text()

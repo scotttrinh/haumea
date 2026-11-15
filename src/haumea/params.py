@@ -1,7 +1,7 @@
 """Work out a handler's inputs from its signature.
 
 - a parameter named like a path segment (``[item_id]``) comes from the path
-- a Pydantic model comes from the JSON body
+- a model (msgspec ``Struct``, dataclass or attrs class) comes from the JSON body
 - a ``Request`` annotation receives the request
 - ``Depends(fn)`` is the result of calling ``fn``, resolved the same way
 - anything else is a query parameter
@@ -12,13 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
-import json
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Annotated, Any, get_args, get_origin
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+import msgspec
 
 from haumea.exceptions import RequestValidationError
 from haumea.requests import Request
@@ -62,9 +63,8 @@ class Field:
     name: str
     source: str  # path | query | header | body | request | depends
     alias: str
-    annotation: Any
+    annotation: Any  # as written, including any Annotated[..., Meta(...)]
     default: Any = _MISSING
-    adapter: TypeAdapter[Any] | None = None
     dependency: Endpoint | None = None
 
     @property
@@ -73,7 +73,10 @@ class Field:
 
     @property
     def is_list(self) -> bool:
-        return get_origin(self.annotation) in (list, set, tuple)
+        annotation = self.annotation
+        if get_origin(annotation) is Annotated:
+            annotation = get_args(annotation)[0]
+        return get_origin(annotation) in (list, set, tuple)
 
 
 class Endpoint:
@@ -116,7 +119,9 @@ class Endpoint:
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         body_fields = [field for field in self.fields if field.source == "body"]
-        body = await _read_body(request, errors) if body_fields else _MISSING
+        body = _MISSING
+        if len(body_fields) > 1:  # each field is a key of a JSON object
+            body = _decode_body(await request.body(), dict[str, Any], errors)
 
         for field in self.fields:
             if field.source == "request":
@@ -126,63 +131,87 @@ class Endpoint:
                 if func not in cache:  # each dependency runs once per request
                     cache[func] = await field.dependency._call(request, cache, errors)
                 kwargs[field.name] = cache[func]
+            elif field.source == "body" and len(body_fields) == 1:
+                # Decode and validate straight from the bytes, in one pass.
+                value = _decode_body(await request.body(), field.annotation, errors)
+                kwargs[field.name] = _or_default(field, value, ["body"], errors)
+            elif field.source == "body":
+                raw = (
+                    body.get(field.alias, _MISSING) if isinstance(body, dict) else body
+                )
+                kwargs[field.name] = _convert(field, raw, strict=True, errors=errors)
             else:
-                loc = [field.source, field.alias]
+                # Path, query and header values are strings: convert leniently.
                 if field.source == "path":
                     raw = request.path_params.get(field.alias, _MISSING)
                 elif field.source == "header":
                     raw = request.headers.get(field.alias.lower(), _MISSING)
-                elif field.source == "query":
+                else:
                     values = request.query_params.get(field.alias)
                     raw = values or _MISSING
                     if values and not field.is_list:
                         raw = values[-1]
-                elif len(body_fields) == 1:
-                    raw, loc = body, ["body"]
-                else:  # several body fields: each is a key of a JSON object
-                    raw = body.get(field.alias, _MISSING) if _is_dict(body) else body
-                kwargs[field.name] = _validate(field, raw, loc, errors)
+                kwargs[field.name] = _convert(field, raw, strict=False, errors=errors)
         return kwargs
 
 
-def _is_dict(value: Any) -> bool:
-    return isinstance(value, dict)
+_ERROR_PATH = re.compile(r" - at `\$(.*)`$")
+_PATH_PART = re.compile(r"\.([^.\[]+)|\[(\d+|\.\.\.)\]")
 
 
-async def _read_body(request: Request, errors: list[dict[str, Any]]) -> Any:
-    raw = await request.body()
+def _error(loc: list[Any], exc: msgspec.MsgspecError) -> dict[str, Any]:
+    """Turn a msgspec error into ``{"loc": [...], "msg": "..."}``.
+
+    msgspec reports the first problem it finds, with a path suffix like
+    ``- at `$.items[0].price```; fold that path into ``loc``.
+    """
+    msg = str(exc)
+    if match := _ERROR_PATH.search(msg):
+        msg = msg[: match.start()]
+        for key, index in _PATH_PART.findall(match[1]):
+            loc = [*loc, key or (int(index) if index.isdigit() else index)]
+    return {"loc": loc, "msg": msg}
+
+
+def _decode_body(raw: bytes, annotation: Any, errors: list[dict[str, Any]]) -> Any:
     if not raw:
         return _MISSING
     try:
-        return json.loads(raw)
-    except ValueError:
-        errors.append(
-            {
-                "type": "json_invalid",
-                "loc": ["body"],
-                "msg": "Invalid JSON",
-                "input": None,
-            }
-        )
+        return msgspec.json.decode(raw, type=annotation)
+    except msgspec.MsgspecError as exc:
+        errors.append(_error(["body"], exc))
         return None
 
 
-def _validate(
-    field: Field, raw: Any, loc: list[Any], errors: list[dict[str, Any]]
+def _or_default(
+    field: Field, value: Any, loc: list[Any], errors: list[dict[str, Any]]
 ) -> Any:
+    if value is not _MISSING:
+        return value
+    if field.required:
+        errors.append({"loc": loc, "msg": "Field required"})
+    return field.default
+
+
+def _convert(
+    field: Field, raw: Any, *, strict: bool, errors: list[dict[str, Any]]
+) -> Any:
+    loc = [field.source, field.alias]
     if raw is _MISSING:
-        if field.required:
-            errors.append(
-                {"type": "missing", "loc": loc, "msg": "Field required", "input": None}
-            )
-        return field.default
-    assert field.adapter
+        return _or_default(field, raw, loc, errors)
     try:
-        return field.adapter.validate_python(raw)
-    except ValidationError as exc:
-        for error in exc.errors(include_url=False, include_context=False):
-            errors.append({**error, "loc": [*loc, *error["loc"]]})
+        return msgspec.convert(raw, field.annotation, strict=strict)
+    except msgspec.MsgspecError as exc:
+        errors.append(_error(loc, exc))
         return None
+
+
+def _is_model(annotation: Any) -> bool:
+    return isinstance(annotation, type) and (
+        issubclass(annotation, msgspec.Struct)
+        or dataclasses.is_dataclass(annotation)
+        or hasattr(annotation, "__attrs_attrs__")
+    )
 
 
 def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
@@ -196,6 +225,7 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
 
     # A marker may be the default (`q: str = Query()`) or in Annotated metadata.
     marker = None
+    declared = annotation
     if get_origin(annotation) is Annotated:
         annotation, *metadata = get_args(annotation)
         marker = next(
@@ -213,15 +243,15 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
 
     if isinstance(marker, DependsInfo):
         dependency = Endpoint(marker.dependency, path_params)
-        return Field(name, "depends", name, annotation, dependency=dependency)
+        return Field(name, "depends", name, declared, dependency=dependency)
     if annotation is Request:
-        return Field(name, "request", name, annotation)
+        return Field(name, "request", name, declared)
 
     if isinstance(marker, ParamInfo):
         source = marker.source
     elif name in path_params:
         source = "path"
-    elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+    elif _is_model(annotation):
         source = "body"
     else:
         source = "query"
@@ -229,4 +259,4 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
     alias = marker.alias if isinstance(marker, ParamInfo) and marker.alias else name
     if source == "header" and alias == name:
         alias = name.replace("_", "-")
-    return Field(name, source, alias, annotation, default, TypeAdapter(annotation))
+    return Field(name, source, alias, declared, default)

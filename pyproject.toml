@@ -5,7 +5,7 @@ description = "A serverless-first Python web framework"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic>=2.9",
+    "msgspec>=0.22.0",
     "uvicorn>=0.30",
 ]
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic_core import to_json
+import msgspec
 
 from haumea.requests import Send
 
@@ -49,12 +49,12 @@ class Response:
 
 
 class JSONResponse(Response):
-    """Serializes Pydantic models, dataclasses, datetimes, etc. as JSON."""
+    """Serializes Structs, dataclasses, attrs classes, datetimes, etc. as JSON."""
 
     media_type = "application/json"
 
     def render(self, content: Any) -> bytes:
-        return to_json(content)
+        return msgspec.json.encode(content)
 
 
 class HTMLResponse(Response):

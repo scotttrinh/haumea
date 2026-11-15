@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from typing import Annotated
+
+from msgspec import Meta, Struct
 
 from haumea import Depends, Header, HTTPException
 
@@ -6,9 +8,9 @@ from haumea import Depends, Header, HTTPException
 max_duration = 10
 
 
-class Item(BaseModel):
+class Item(Struct):
     name: str
-    price: float
+    price: Annotated[float, Meta(gt=0)]
 
 
 def current_user(authorization: str = Header()) -> str:
