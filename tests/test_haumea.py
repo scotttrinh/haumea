@@ -31,6 +31,7 @@ def client():
     return request
 
 
+# @lat: [[tests#Routes and parameters]]
 def test_routes_and_parameters(client):
     assert client("GET", "/").json() == {"message": "Hello from Haumea"}
     assert client("GET", "/api/hello?name=jj").json() == {"hello": "jj"}
@@ -46,6 +47,7 @@ def test_routes_and_parameters(client):
     assert client("GET", "/nope").json() == {"detail": "Not Found"}
 
 
+# @lat: [[tests#Validation errors]]
 def test_validation_errors(client):
     response = client("GET", "/api/items/nope")
     assert response.status_code == 422
@@ -74,6 +76,7 @@ def test_validation_errors(client):
     assert response.json()["detail"] == [{"loc": ["body"], "msg": "Field required"}]
 
 
+# @lat: [[tests#Body and dependencies]]
 def test_body_and_dependencies(client):
     item = {"name": "x", "price": 1.5}
     assert client("PUT", "/api/items/7", json=item, headers=AUTH).json() == item
@@ -87,6 +90,7 @@ def test_body_and_dependencies(client):
     assert response.json() == {"detail": "Not authenticated"}
 
 
+# @lat: [[tests#Dev docs and static files]]
 def test_dev_docs_and_static_files(client):
     assert "static file" in client("GET", "/hello.txt").text
     assert client("GET", "/../pyproject.toml").status_code == 404
@@ -119,6 +123,7 @@ def output():
     return build(EXAMPLE, platform=None)
 
 
+# @lat: [[tests#Build output layout]]
 def test_build_output_layout(output):
     config = json.loads((output / "config.json").read_text())
     assert config["version"] == 3
@@ -175,6 +180,7 @@ def invoke(output, function, path):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+# @lat: [[tests#Built function invocation]]
 def test_built_functions_handle_their_own_route(output):
     response = invoke(output, "api/items/[item_id]", "/api/items/42?q=1")
     assert response["statusCode"] == 200
