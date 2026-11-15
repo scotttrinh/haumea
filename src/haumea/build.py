@@ -27,8 +27,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from fastapi.openapi.docs import get_swagger_ui_html
-
+from haumea.openapi import swagger_html
 from haumea.routing import Route, create_app, discover_routes
 
 OUTPUT_DIR = Path(".vercel") / "output"
@@ -156,12 +155,9 @@ def _write_function(
 
 def _write_docs(project_dir: Path, static_dir: Path) -> None:
     """Render the API docs once, at build time, as static files."""
-    schema = create_app(project_dir / "app", title=project_dir.name).openapi()
-    (static_dir / "openapi.json").write_text(json.dumps(schema))
-    html = get_swagger_ui_html(
-        openapi_url="/openapi.json", title=schema["info"]["title"]
-    )
-    (static_dir / "docs.html").write_bytes(bytes(html.body))
+    app = create_app(project_dir / "app", title=project_dir.name)
+    (static_dir / "openapi.json").write_text(json.dumps(app.openapi()))
+    (static_dir / "docs.html").write_text(swagger_html(app.title))
 
 
 def build(

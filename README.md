@@ -4,13 +4,12 @@ A Python framework for seamless serverless usage
 
 ## Design
 
-A familiar FastAPI-like backend optimized for serverless deployments. Has native support for Vercel's [Build Outputs API](https://vercel.com/docs/build-output-api).
+A serverless-first Python web framework. Its handler API follows the shape FastAPI made familiar (typed signatures, Pydantic models, `Depends`, generated OpenAPI) but is built from the ground up around one-function-per-route deployments. Has native support for Vercel's [Build Outputs API](https://vercel.com/docs/build-output-api).
 
 ## Usage
 
 Routes live in an `app/` directory, laid out like the Next.js App Router. Each
-`route.py` exports functions named after HTTP methods, and each of those is a
-plain FastAPI path operation function:
+`route.py` exports functions named after HTTP methods:
 
 ```
 app/route.py                      ->  /
@@ -23,9 +22,42 @@ public/                           ->  static files
 
 ```python
 # app/api/items/[item_id]/route.py
-def GET(item_id: int):
-    return {"item_id": item_id}
+from haumea import Depends, Header, HTTPException
+from pydantic import BaseModel
+
+
+class Item(BaseModel):
+    name: str
+    price: float
+
+
+def current_user(authorization: str = Header()) -> str:
+    if authorization != "Bearer secret":
+        raise HTTPException(401, "Not authenticated")
+    return "scott"
+
+
+def GET(item_id: int, verbose: bool = False):
+    return {"item_id": item_id, "verbose": verbose}
+
+
+async def PUT(item_id: int, item: Item, user: str = Depends(current_user)):
+    return {"item_id": item_id, "updated_by": user, **item.model_dump()}
 ```
+
+A handler's signature declares its inputs, which are validated with Pydantic
+(invalid requests get a `422`):
+
+- a parameter named after a `[segment]` comes from the path
+- a Pydantic model comes from the JSON body
+- `Depends(fn)` is the result of calling `fn`, whose own signature is resolved
+  the same way
+- a `Request` annotation receives the raw request
+- anything else is a query parameter; `Query()`, `Header()` and `Body()`
+  override the default
+
+Handlers can be sync or async, and return JSON-serializable data or a
+`Response`.
 
 ```sh
 haumea dev      # local server with reload
@@ -38,8 +70,8 @@ cold-start and are configured independently. A route can set per-function
 options as module-level values, like Next.js route segment config:
 
 ```python
-max_duration = 30         # seconds
-memory = 1024             # MB
+max_duration = 30  # seconds
+memory = 1024  # MB
 regions = ["iad1"]
 ```
 
