@@ -1,5 +1,8 @@
 from pydantic import BaseModel
 
+# Per-function settings, like Next.js route segment config.
+max_duration = 10
+
 
 class Item(BaseModel):
     name: str

@@ -37,18 +37,34 @@ def output():
 def test_build_output_layout(output):
     config = json.loads((output / "config.json").read_text())
     assert config["version"] == 3
-    assert config["routes"][0] == {"handle": "filesystem"}
+    assert config["routes"] == [
+        {"handle": "filesystem"},
+        {"src": "^/docs$", "dest": "/docs.html"},
+        {"src": "^/api/items/([^/]+)$", "dest": "/api/items/[item_id]"},
+    ]
 
-    assert (output / "static" / "hello.txt").is_file()
+    static = output / "static"
+    assert (static / "hello.txt").is_file()
+    assert "swagger" in (static / "docs.html").read_text().lower()
+    schema = json.loads((static / "openapi.json").read_text())
+    assert set(schema["paths"]) == {"/", "/api/hello", "/api/items/{item_id}"}
 
-    func = output / "functions" / "index.func"
+    functions = output / "functions"
+    assert {p.relative_to(functions).as_posix() for p in functions.rglob("*.func")} == {
+        "index.func",
+        "api/hello.func",
+        "api/items/[item_id].func",
+    }
+    func = functions / "api" / "items" / "[item_id].func"
     vc_config = json.loads((func / ".vc-config.json").read_text())
     assert vc_config["runtime"] == "python3.12"
     assert vc_config["handler"] == "vc__handler__python.vc_handler"
-    assert (func / "app" / "api" / "hello" / "route.py").is_file()
+    assert vc_config["maxDuration"] == 10
     assert (func / "_vendor" / "fastapi").is_dir()
-    assert (func / "_vendor" / "haumea").is_dir()
     assert not (func / "public").exists()
+
+    hello_config = (functions / "api" / "hello.func" / ".vc-config.json").read_text()
+    assert "maxDuration" not in json.loads(hello_config)
 
 
 INVOKE = """
@@ -59,17 +75,27 @@ print(json.dumps(vc_handler(event, None)))
 """
 
 
-def test_built_function_handles_requests(output):
-    """Invoke the function the way Vercel does, using only vendored deps."""
-    func = output / "functions" / "index.func"
+def invoke(output, function, path):
+    """Invoke a built function the way Vercel does, using only vendored deps."""
     result = subprocess.run(
-        [sys.executable, "-S", "-c", INVOKE, "/api/items/42?q=1"],
-        cwd=func,
+        [sys.executable, "-S", "-c", INVOKE, path],
+        cwd=output / "functions" / f"{function}.func",
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert result.returncode == 0, result.stderr
-    response = json.loads(result.stdout.strip().splitlines()[-1])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_built_functions_handle_their_own_route(output):
+    response = invoke(output, "api/items/[item_id]", "/api/items/42?q=1")
     assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"item_id": 42}
+
+    response = invoke(output, "index", "/")
+    assert json.loads(response["body"]) == {"message": "Hello from Haumea"}
+
+    # Each function only knows its own route.
+    assert invoke(output, "api/hello", "/api/items/42")["statusCode"] == 404
+    assert invoke(output, "api/hello", "/docs")["statusCode"] == 404

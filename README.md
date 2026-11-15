@@ -33,9 +33,24 @@ haumea build    # writes .vercel/output (Build Output API v3)
 vercel deploy --prebuilt
 ```
 
-`haumea build` produces a single Python function containing the app and its
-vendored dependencies (resolved from the project's `pyproject.toml` with `uv`),
-plus `public/` as static files. See [`examples/hello`](examples/hello).
+`haumea build` deploys each `route.py` as its own function, so routes scale,
+cold-start and are configured independently. A route can set per-function
+options as module-level values, like Next.js route segment config:
+
+```python
+max_duration = 30         # seconds
+memory = 1024             # MB
+regions = ["iad1"]
+```
+
+Framework features that assume one long-lived app are adapted to this model
+rather than run inside a function. The API docs are the first example: the
+OpenAPI schema and Swagger UI are rendered at build time and served as static
+files at `/openapi.json` and `/docs`, straight from the CDN.
+
+Dependencies are resolved from the project's `pyproject.toml` with `uv` and
+vendored into every function; `public/` is served as static files. See
+[`examples/hello`](examples/hello).
 
 ## Development
 
