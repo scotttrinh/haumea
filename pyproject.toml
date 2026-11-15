@@ -16,6 +16,8 @@ haumea = "haumea.cli:main"
 dev = [
     "httpx>=0.27",
     "pytest>=8",
+    "ruff>=0.17.5",
+    "ty>=0.0.104",
 ]
 
 [build-system]
@@ -24,3 +26,10 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

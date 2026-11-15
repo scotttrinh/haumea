@@ -87,12 +87,32 @@ def _install_dependencies(
     with tempfile.TemporaryDirectory() as tmp:
         requirements = Path(tmp) / "requirements.txt"
         _run(
-            ["uv", "export", "--no-dev", "--no-emit-project", "--no-editable",
-             "--no-hashes", "--quiet", "-o", str(requirements)],
+            [
+                "uv",
+                "export",
+                "--no-dev",
+                "--no-emit-project",
+                "--no-editable",
+                "--no-hashes",
+                "--quiet",
+                "-o",
+                str(requirements),
+            ],
             cwd=project_dir,
         )
-        cmd = ["uv", "pip", "install", "--quiet", "--target", str(vendor_dir),
-               "--python-version", python, "-r", str(requirements), "vercel-runtime"]
+        cmd = [
+            "uv",
+            "pip",
+            "install",
+            "--quiet",
+            "--target",
+            str(vendor_dir),
+            "--python-version",
+            python,
+            "-r",
+            str(requirements),
+            "vercel-runtime",
+        ]
         if platform:
             cmd += ["--python-platform", platform]
         _run(cmd, cwd=project_dir)

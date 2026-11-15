@@ -88,6 +88,8 @@ requires-dist = [
 dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.17.5" },
+    { name = "ty", specifier = ">=0.0.104" },
 ]
 
 [[package]]
