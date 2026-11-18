@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from haumea.openapi import swagger_html
@@ -129,15 +130,62 @@ def _install_dependencies(
         _run(cmd, cwd=project_dir)
 
 
-def _write_function(
-    route: Route, shared: Path, functions_dir: Path, python: str
-) -> None:
-    func_dir = functions_dir / f"{route.function}.func"
-    func_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(shared, func_dir, copy_function=os.link)
+@dataclass(frozen=True)
+class FunctionSpec:
+    """One Vercel function: a route and everything emitted beside its payload."""
 
+    name: str
+    """Function path under ``functions/``, without ``.func``."""
+    route: Route
+    entrypoint: str
+    """Source of the function's ``index.py``."""
+    vc_config: dict[str, object]
+    """Content of the function's ``.vc-config.json``."""
+
+
+@dataclass(frozen=True)
+class StaticFile:
+    """One file generated under ``static/`` at build time."""
+
+    path: str
+    """Destination path relative to ``static/``, in POSIX form."""
+    content: str
+
+
+@dataclass(frozen=True)
+class BuildPlan:
+    """Everything ``build`` will write, decided before touching the output."""
+
+    project_dir: Path
+    workspace_root: Path
+    app_dir: Path
+    public_dir: Path | None
+    """The project's ``public/`` directory, or None if it has none."""
+    output_dir: Path
+    python: str
+    platform: str | None
+    functions: tuple[FunctionSpec, ...]
+    static_files: tuple[StaticFile, ...]
+    """Generated files written into ``static/`` over ``public/``."""
+    routes: tuple[dict[str, str], ...]
+    """The ``routes`` array of ``config.json``."""
+
+
+def _clone_config(value: object) -> object:
+    """Copy nested JSON containers without invoking ``__deepcopy__`` or
+    collapsing distinct dict keys like ``1`` and ``"1"``."""
+    if isinstance(value, dict):
+        return {key: _clone_config(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_config(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_config(item) for item in value)
+    return value
+
+
+def _plan_function(route: Route, python: str) -> FunctionSpec:
     module = route.load()
-    config = {
+    config: dict[str, object] = {
         "runtime": f"python{python}",
         "handler": f"{HANDLER_MODULE}.vc_handler",
         "supportsResponseStreaming": True,
@@ -145,19 +193,118 @@ def _write_function(
     }
     for name, key in ROUTE_CONFIG.items():
         if hasattr(module, name):
-            config[key] = getattr(module, name)
-
-    (func_dir / ENTRYPOINT).write_text(
-        ENTRYPOINT_SOURCE.format(function=route.function)
+            config[key] = _clone_config(getattr(module, name))
+    return FunctionSpec(
+        name=route.function,
+        route=route,
+        entrypoint=ENTRYPOINT_SOURCE.format(function=route.function),
+        vc_config=config,
     )
-    (func_dir / ".vc-config.json").write_text(json.dumps(config, indent=2))
 
 
-def _write_docs(project_dir: Path, static_dir: Path) -> None:
+def _plan_static(project_dir: Path, app_dir: Path) -> tuple[StaticFile, ...]:
     """Render the API docs once, at build time, as static files."""
-    app = create_app(project_dir / "app", title=project_dir.name)
-    (static_dir / "openapi.json").write_text(json.dumps(app.openapi()))
-    (static_dir / "docs.html").write_text(swagger_html(app.title))
+    app = create_app(app_dir, title=project_dir.name)
+    return (
+        StaticFile("openapi.json", json.dumps(app.openapi())),
+        StaticFile("docs.html", swagger_html(app.title)),
+    )
+
+
+def _plan_routes(routes: list[Route]) -> tuple[dict[str, str], ...]:
+    # Static files and static-path functions are matched by the filesystem
+    # check; only dynamic routes need a rewrite to their function.
+    rewrites = [{"src": "^/docs$", "dest": "/docs.html"}]
+    rewrites += [
+        {"src": route.pattern, "dest": f"/{route.function}"}
+        for route in routes
+        if route.pattern
+    ]
+    return ({"handle": "filesystem"}, *rewrites)
+
+
+def plan_build(
+    project_dir: str | Path = ".",
+    *,
+    python: str = DEFAULT_PYTHON,
+    platform: str | None = DEFAULT_PLATFORM,
+) -> BuildPlan:
+    """Discover ``project_dir``'s routes and plan its build, leaving the output
+    directory untouched.
+
+    Imports every route module, so route code runs now, during planning,
+    rather than during emission. Routes are assumed not to modify the
+    project's source files at import time: ``emit_build`` copies the project
+    and ``public/`` trees as they are when it runs.
+    """
+    # Discover, before importing any route module.
+    project_dir = Path(project_dir).resolve()
+    if not (project_dir / "pyproject.toml").is_file():
+        raise FileNotFoundError(f"no pyproject.toml in {project_dir}")
+    app_dir = project_dir / "app"
+    public: Path | None = project_dir / "public"
+    if not public.is_dir():
+        public = None
+    routes = discover_routes(app_dir)
+
+    # Plan.
+    return BuildPlan(
+        project_dir=project_dir,
+        workspace_root=project_dir,
+        app_dir=app_dir,
+        public_dir=public,
+        output_dir=project_dir / OUTPUT_DIR,
+        python=python,
+        platform=platform,
+        functions=tuple(_plan_function(route, python) for route in routes),
+        static_files=_plan_static(project_dir, app_dir),
+        routes=_plan_routes(routes),
+    )
+
+
+def _write_function(spec: FunctionSpec, shared: Path, functions_dir: Path) -> None:
+    func_dir = functions_dir / f"{spec.name}.func"
+    func_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(shared, func_dir, copy_function=os.link)
+    (func_dir / ENTRYPOINT).write_text(spec.entrypoint)
+    (func_dir / ".vc-config.json").write_text(json.dumps(spec.vc_config, indent=2))
+
+
+def _write_static(plan: BuildPlan, static_dir: Path) -> None:
+    public_dir = plan.public_dir or (plan.project_dir / "public")
+    if public_dir.is_dir():
+        shutil.copytree(public_dir, static_dir)
+    else:
+        static_dir.mkdir()
+    for file in plan.static_files:
+        dest = static_dir / file.path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(file.content)
+
+
+def emit_build(plan: BuildPlan) -> Path:
+    """Write ``plan`` to its output directory and return that path."""
+    output = plan.output_dir
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+
+    # Assemble what every function shares once, then hard-link it into each.
+    with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
+        shared = Path(tmp) / "shared"
+        shutil.copytree(plan.project_dir, shared, ignore=IGNORE)
+        (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
+        _install_dependencies(
+            plan.project_dir, shared / VENDOR_DIR, plan.python, plan.platform
+        )
+        for spec in plan.functions:
+            _write_function(spec, shared, output / "functions")
+
+    _write_static(plan, output / "static")
+    (output / "config.json").write_text(
+        json.dumps({"version": 3, "routes": list(plan.routes)}, indent=2)
+    )
+    return output
 
 
 def build(
@@ -171,44 +318,4 @@ def build(
     Pass ``platform=None`` to vendor dependencies for the current machine,
     which makes the output runnable locally (used by the tests).
     """
-    project_dir = Path(project_dir).resolve()
-    if not (project_dir / "pyproject.toml").is_file():
-        raise FileNotFoundError(f"no pyproject.toml in {project_dir}")
-    routes = discover_routes(project_dir / "app")
-
-    output = project_dir / OUTPUT_DIR
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
-
-    # Assemble what every function shares once, then hard-link it into each.
-    with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
-        shared = Path(tmp) / "shared"
-        shutil.copytree(project_dir, shared, ignore=IGNORE)
-        (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
-        _install_dependencies(project_dir, shared / VENDOR_DIR, python, platform)
-        for route in routes:
-            _write_function(route, shared, output / "functions", python)
-
-    static_dir = output / "static"
-    public_dir = project_dir / "public"
-    if public_dir.is_dir():
-        shutil.copytree(public_dir, static_dir)
-    else:
-        static_dir.mkdir()
-    _write_docs(project_dir, static_dir)
-
-    # Static files and static-path functions are matched by the filesystem
-    # check; only dynamic routes need a rewrite to their function.
-    rewrites = [{"src": "^/docs$", "dest": "/docs.html"}]
-    rewrites += [
-        {"src": route.pattern, "dest": f"/{route.function}"}
-        for route in routes
-        if route.pattern
-    ]
-    (output / "config.json").write_text(
-        json.dumps(
-            {"version": 3, "routes": [{"handle": "filesystem"}, *rewrites]}, indent=2
-        )
-    )
-    return output
+    return emit_build(plan_build(project_dir, python=python, platform=platform))

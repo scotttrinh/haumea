@@ -22,6 +22,18 @@ Verify JSON body decoding alongside `Depends` and `Header` resolution, missing h
 
 Verify `public/` static file serving, path traversal rejection (`404`), `/docs` Swagger UI, and `/openapi.json` schema generation including summaries, parameters, `$ref` schemas, and `Meta` constraints.
 
+## Build plan
+
+Verify [[src/haumea/build.py#plan_build]] on a temporary project without writing output: paths, functions, entrypoints, `.vc-config.json` overrides, generated docs, and `config.json` routes.
+
+The `isolated_imports` fixture restores `sys.path` and `sys.modules` after loading route modules and disables bytecode writes.
+
+## Build emit
+
+Verify [[src/haumea/build.py#emit_build]] (with vendoring stubbed) preserves `copytree` semantics for `public/` (symlinks, modes, late files/dirs) and clones route config safely.
+
+Checks mutable `regions` isolation, mixed dict keys, and values whose `__deepcopy__` raises.
+
 ## Build output layout
 
 Verify `.vercel/output` `config.json` rewrites, static `docs.html`/`openapi.json`/`public/` files, per-route `.func` directories, `.vc-config.json` `maxDuration` overrides, and `_vendor` contents.

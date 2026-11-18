@@ -7,8 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from haumea import build as build_module
 from haumea import create_app
-from haumea.build import build
+from haumea.build import build, emit_build, plan_build
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
 AUTH = {"Authorization": "Bearer secret"}
@@ -115,6 +116,157 @@ def test_dev_docs_and_static_files(client):
         "required": False,
         "schema": {"type": "boolean"},
     }
+
+
+@pytest.fixture
+def isolated_imports(monkeypatch):
+    """Undo the sys.path and sys.modules changes made by loading route modules."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    modules = set(sys.modules)
+    yield
+    for name in set(sys.modules) - modules:
+        del sys.modules[name]
+
+
+def write_project(project: Path, files: dict[str, str]) -> None:
+    for name, content in files.items():
+        (project / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / name).write_text(content)
+
+
+# @lat: [[tests#Build plan]]
+def test_build_plan(tmp_path, isolated_imports):
+    project = tmp_path / "shop"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "shop"\nversion = "0"\n',
+            "app/(admin)/orders/route.py": "def GET():\n    return []\n",
+            "app/orders/[order_id]/route.py": (
+                "max_duration = 30\nmemory = 1024\nregions = ['iad1']\n\n"
+                "def GET(order_id: int):\n    return {'id': order_id}\n"
+            ),
+            "public/css/site.css": "body {}\n",
+        },
+    )
+
+    plan = plan_build(project, python="3.13")
+
+    assert plan.project_dir == plan.workspace_root == project
+    assert plan.app_dir == project / "app"
+    assert plan.public_dir == project / "public"
+    assert plan.output_dir == project / ".vercel" / "output"
+    assert not plan.output_dir.exists()
+
+    assert [f.name for f in plan.functions] == ["orders", "orders/[order_id]"]
+    assert [f.route.url_path for f in plan.functions] == [
+        "/orders",
+        "/orders/{order_id}",
+    ]
+    orders, order = plan.functions
+    assert "create_route_app(" in order.entrypoint
+    assert order.entrypoint.rstrip().endswith("'orders/[order_id]')")
+    assert order.vc_config == {
+        "runtime": "python3.13",
+        "handler": "vc__handler__python.vc_handler",
+        "supportsResponseStreaming": True,
+        "environment": {"PYTHONDONTWRITEBYTECODE": "1"},
+        "maxDuration": 30,
+        "memory": 1024,
+        "regions": ["iad1"],
+    }
+    assert set(orders.vc_config) == {
+        "runtime",
+        "handler",
+        "supportsResponseStreaming",
+        "environment",
+    }
+
+    static = {f.path: f.content for f in plan.static_files}
+    assert set(static) == {"openapi.json", "docs.html"}
+    assert set(json.loads(static["openapi.json"])["paths"]) == {
+        "/orders",
+        "/orders/{order_id}",
+    }
+    assert "swagger" in static["docs.html"].lower()
+
+    assert plan.routes == (
+        {"handle": "filesystem"},
+        {"src": "^/docs$", "dest": "/docs.html"},
+        {"src": "^/orders/([^/]+)$", "dest": "/orders/[order_id]"},
+    )
+
+
+# @lat: [[tests#Build emit]]
+def test_emit_build_preserves_public_and_config_isolation(
+    tmp_path, isolated_imports, monkeypatch
+):
+    project = tmp_path / "snap"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "snap"\nversion = "0"\n',
+            "snap_config.py": (
+                "REGIONS = ['iad1']\n\n"
+                "class Regions(list):\n"
+                "    def __deepcopy__(self, memo):\n"
+                "        raise TypeError('no deepcopy')\n"
+            ),
+            "app/a/route.py": "from snap_config import REGIONS as regions\n",
+            "app/b/route.py": (
+                "from pathlib import Path\nfrom snap_config import REGIONS\n"
+                "REGIONS.append('sfo1')\n"
+                "(Path(__file__).parents[2] / 'public' / 'late.txt').write_text('x')\n"
+            ),
+            "app/c/route.py": (
+                "from snap_config import Regions\nregions = Regions(['cdg1'])\n"
+            ),
+            "app/d/route.py": "regions = {1: 'first', '1': 'second'}\n",
+            "assets/logo.svg": "<svg/>",
+        },
+    )
+    (project / "public" / "empty").mkdir(parents=True)
+    (project / "public" / "empty").chmod(0o750)
+    (project / "public" / "linked").symlink_to(project / "assets")
+
+    plan = plan_build(project)
+    assert plan.functions[0].vc_config["regions"] == ["iad1"]
+    assert plan.functions[2].vc_config["regions"] == ["cdg1"]
+
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    output = emit_build(plan)
+
+    static = output / "static"
+    assert (static / "linked" / "logo.svg").read_text() == "<svg/>"
+    assert (static / "empty").stat().st_mode & 0o777 == 0o750
+    # Like the original builder, public/ is copied after route imports.
+    assert (static / "late.txt").read_text() == "x"
+    functions = output / "functions"
+    assert (functions / "b.func" / "app" / "b" / "route.py").is_file()
+    a_config = json.loads((functions / "a.func" / ".vc-config.json").read_text())
+    assert a_config["regions"] == ["iad1"]
+    c_config = json.loads((functions / "c.func" / ".vc-config.json").read_text())
+    assert c_config["regions"] == ["cdg1"]
+    d_raw = (functions / "d.func" / ".vc-config.json").read_text()
+    assert d_raw.count('"1":') == 2
+
+    # public/ created during route imports is also discovered at emit time.
+    late_public = tmp_path / "late_public"
+    write_project(
+        late_public,
+        {
+            "pyproject.toml": '[project]\nname = "late"\nversion = "0"\n',
+            "app/late/route.py": (
+                "from pathlib import Path\n"
+                "pub = Path(__file__).parents[2] / 'public'\n"
+                "pub.mkdir(exist_ok=True)\n"
+                "(pub / 'late.txt').write_text('created')\n"
+            ),
+        },
+    )
+    late_output = emit_build(plan_build(late_public))
+    assert (late_output / "static" / "late.txt").read_text() == "created"
 
 
 @pytest.fixture(scope="module")
