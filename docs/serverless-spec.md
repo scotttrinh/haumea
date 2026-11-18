@@ -38,9 +38,79 @@ The new route-level variables are `include: list[str]` (§5.5) and `include_in_s
 
 ### 2.1 Platform behavior this relies on
 
-- **Services keep the original path.** A request to `/api/users` reaches the service as `/api/users`. This is documented under [Services routing](https://vercel.com/docs/services/routing).
-- **Each service is a complete Build Output tree.** It lives at `.vercel/output/services/<name>/` with its own `config.json`, `functions/` and `static/`.
-- **The runtime can strip the prefix.** When `VERCEL_SERVICE_ROUTE_PREFIX_STRIP` is set, `vercel-runtime` (`vercel_runtime/routing.py`) strips `VERCEL_SERVICE_ROUTE_PREFIX` from `scope["path"]` and moves it into `scope["root_path"]`.
+These were checked by the 1.1 spike (Vercel CLI 65.12.1, `@vercel/static-build` 27.0.0, `vercel-runtime` 0.26.0). A Haumea backend was deployed as a service beside a Next.js app, built with `vercel build`, run with `vercel dev --local`, and deployed with `vercel deploy`.
+
+#### Spike fixture
+
+The fixture is not the proposed layout in "Service configuration" below; it predates `base_path`.
+
+- **Vercel project.** Deployed to `haumea-spike` (`scotttrinhs-projects`), retained intentionally as a reusable test project for the rest of this implementation effort.
+- **Rewrite.** `{"source": "/api/(.*)", "destination": {"service": "api"}}`, then `/(.*)` to `web`. Neither rewrite sets `destination.path`, and the service declares no `routes` of its own, so no `request.path` transform applies.
+- **Backend.** `examples/hello` with its routes moved under `app/api/` by hand (`app/api/hello`, `app/api/items/[item_id]`, `app/api/debug`), plus unprefixed `app/route.py`, `app/debug/route.py` and `public/hello.txt`. The debug routes echo `scope["path"]`, `scope["raw_path"]`, `scope["root_path"]` and every `VERCEL_SERVICE_*` variable.
+- **Haumea source.** Resolved from a local copy, `haumea = { path = "vendor/haumea" }`. There is no `.python-version`.
+- **Service.** `framework: "vite"`, `buildCommand: "uv run --frozen haumea build"`, `devCommand: "uv run --frozen haumea dev --port $PORT"`.
+
+Observed requests (same status in `vercel dev` and in the deployment unless noted):
+
+| Request | Reached | Result |
+| --- | --- | --- |
+| `/api/debug` | `api`, `app/api/debug` | 200; `path` and `raw_path` are `/api/debug`, `root_path` is `""`, no `VERCEL_SERVICE_*` variables |
+| `/api/hello?name=x`, `/api/items/42` | `api` | 200 |
+| `/api` | `web` | 404 from Next.js; `(.*)` requires the slash |
+| `/debug` | `web` | 404 from Next.js; the unprefixed `app/debug` is unreachable |
+| `/hello.txt` | `web` | 404 from Next.js |
+| `/api/docs`, `/api/hello.txt` | `api` | 404; the unprefixed `static/docs.html` and `static/hello.txt` don't match |
+| `/api/nope` | `api` | 404: Haumea's JSON body in dev, Vercel's `NOT_FOUND` page when deployed |
+
+#### Conclusions
+
+The path conclusions below hold for a top-level rewrite to a service **without `destination.path` and without a `request.path` transform** in the service's `routes`. [Services routing](https://vercel.com/docs/services/routing) documents that `destination.path` changes which service route is looked up, and that a service `request.path` transform changes the path the code sees. Haumea's service setup uses neither.
+
+- **Services keep the original path.** A request to `/api/users` reaches the service as `/api/users`, with an empty `scope["root_path"]`. Route lookup inside the service also uses the original path.
+- **The prefix is never stripped under `services`.** `vercel-runtime` (`vercel_runtime/routing.py`) only strips `VERCEL_SERVICE_ROUTE_PREFIX` when `VERCEL_SERVICE_ROUTE_PREFIX_STRIP` is set. Under `services` that variable is never set:
+  - The CLI only injects it for the legacy `experimentalServices` schema with a `routePrefix`.
+  - `services` entries reject both `routePrefix` and `mount`.
+  - Neither variable appeared in `vercel dev` or the deployed function.
+
+  Haumea must therefore match the full prefixed path itself. §2.2 still defines `root_path` handling in case a future platform version strips the prefix.
+- **Static files and docs must be prefixed too.** The service's own route lookup sees `/api/docs`, so unprefixed static files never match.
+- **The rewrite must also match the bare prefix.** `"/api/(.*)"` compiles to `^/api(?:/(.*))$`, so `/api` itself falls through to the next rewrite (the frontend). Use `"/api/:path*"`, which compiles to `^/api(?:/…)?$`, when `app/route.py` should serve `/api`. This is read from the compiled route, not deployed.
+- **Unmatched paths differ between dev and deployment.** Routing into a service is final. When deployed, a path with no function and no rewrite in the service's `config.json` gets Vercel's `NOT_FOUND` page. In `vercel dev` the proxy forwards it to `haumea dev`, which returns Haumea's JSON 404. Both are 404s; only the body differs.
+
+#### Service configuration
+
+With `base_path` (§2.2), a Haumea service is declared like this. It differs from the spike fixture in two ways: the rewrite is `/api/:path*` so that bare `/api` reaches the backend, and routes live at `app/` with `base_path = "/api"` instead of under `app/api/`.
+
+```json
+{
+  "services": {
+    "web": { "root": "frontend/", "framework": "nextjs" },
+    "api": {
+      "root": "backend/",
+      "framework": "vite",
+      "buildCommand": "uv run --frozen haumea build",
+      "devCommand": "uv run --frozen haumea dev --port $PORT"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": { "service": "api" } },
+    { "source": "/(.*)", "destination": { "service": "web" } }
+  ]
+}
+```
+
+- **The service must build with `@vercel/static-build`.** That is the only builder that runs `buildCommand` and then consumes a Build Output v3 tree.
+  - Without `framework`, a `pyproject.toml` is auto-detected as `python`, and the build fails because no `entrypoint` is set.
+  - `framework: "python"` uses `@vercel/python`. That builder runs `buildCommand` only as a pre-step and still requires and builds its own entrypoint.
+  - `framework` must be a non-empty known slug, so `null`, `""` and `"other"` are rejected.
+  - Any frontend slug whose framework has no `useRuntime`, such as `"vite"`, maps to `@vercel/static-build`. The slug is otherwise unused because `buildCommand` and `devCommand` override its defaults. `vercel dev` labels the service "Vite".
+- **Build output location.** After `buildCommand`, `@vercel/static-build` looks for `<service root>/.vercel/output/config.json`. If it is there, the CLI moves that tree into `.vercel/output/services/<name>/`. `.vercelignore` is applied to `static/`.
+  - Haumea's `config.json` routes are kept as written, and the CLI adds an empty `crons`.
+  - Function `.vc-config.json` files are not modified; in particular, no service environment variables are injected.
+  - The top-level `config.json` gets the service rewrites as `{"destination": {"service": "api", "type": "service"}}` routes.
+  - The lookup path is fixed, and the service's `outputDirectory` setting does not change it.
+- **Dev.** `vercel dev` runs `devCommand` through a shell in the service root, with `$PORT` set to a free port, and proxies matching requests to it with the original path. `devCommand` is required: `@vercel/static-build` refuses to serve a Build Output v3 tree in dev, and the framework's own default dev command (`vite`) would run otherwise.
+- **Deployed build.** Vercel's build image provides `uv`, and `uv run --frozen haumea build` ran unchanged. With no `.python-version` and `requires-python = ">=3.12"`, `uv` chose CPython 3.14 for the build process. Dependencies were still vendored for 3.12 (`uv pip install --python-version`), and the functions ran on the `python3.12` runtime declared in `.vc-config.json`. Build-time route imports therefore ran on a different minor version than the functions; §5.7 covers how the import check gets a matching interpreter.
 
 ### 2.2 Semantics
 
@@ -55,12 +125,28 @@ The new route-level variables are `include: list[str]` (§5.5) and `include_in_s
   | Docs | `/api/docs` and `/api/openapi.json` |
 
   The `app/` tree doesn't contain the prefix, so moving a project between standalone and service deployments changes only config.
-- **Runtime matching.** `Haumea` matches routes against the full public path. If `scope["root_path"]` is set and `scope["path"]` does not start with it, the full path is `root_path + path`. `request.path` returns the full path in every mode.
+- **Runtime matching.** `Haumea` matches routes against the full public path, and `request.path` returns that path in every mode.
+- **Scope convention.** Haumea reads the scope the way `vercel-runtime`'s prefix strip writes it (`apply_service_route_prefix_to_asgi_scope`): `scope["path"]` is relative to `scope["root_path"]`, as `PATH_INFO` is to `SCRIPT_NAME` in WSGI. The full path is `root_path + path`, with no `startswith` check, because a stripped path can itself begin with the prefix. The one exception is the prefix root: when `root_path` is non-empty and `path` is `/`, the full path is `root_path` alone:
+
+  | `root_path` | `path` | Full path |
+  | --- | --- | --- |
+  | `""` | `/` | `/` |
+  | `""` | `/api/users` | `/api/users` (services today) |
+  | `/api` | `/` | `/api` |
+  | `/api` | `/users` | `/api/users` |
+  | `/api` | `/apiary` | `/api/apiary` |
+  | `/api` | `/api/users` | `/api/api/users` |
+
+  The other convention, where `path` already includes `root_path` (as `uvicorn --root-path` produces), is not supported. `haumea dev` never sets `root_path`, and no Vercel path sets both.
+- **Trailing slashes.** Haumea route patterns never end in `/` and match exactly, so `/api/users/` does not match a literal route like `app/users/route.py` (while a catch-all such as `app/[...path]/route.py` matches it and captures `users/`). The prefix root follows the same literal rule: `/api` matches `app/route.py` and `/api/` does not. The exception above exists because `vercel-runtime` 0.26.0's `strip_service_route_prefix` maps both `/api` and `/api/` to `root_path="/api"`, `path="/"`. Plain concatenation would turn both into `/api/` and miss the root route. With the exception, both become `/api`. So under a prefix strip, `/api/` also reaches `app/route.py`, while today (no strip, §2.1) it gets a 404. The strip loses the difference between the two, so Haumea can't tell them apart; deeper paths keep their slash (`/api/users/` strips to `/users/`) and behave identically in both modes (unmatched by a literal route like `app/users/route.py`, while a catch-all like `app/[...path]/route.py` still matches and captures `users/`).
 - **OpenAPI.** Paths in `openapi.json` include the prefix, and Swagger UI loads `<base_path>/openapi.json`.
-- **Dev parity.** `haumea dev` serves the same prefixed URLs. Requests outside the prefix return 404.
+- **Dev parity.** `haumea dev` serves the same prefixed URLs. Unmatched paths are a known difference in the response body, not the status:
+  - In dev, any unmatched path, inside or outside the prefix, gets Haumea's JSON 404 (`{"detail": "Not Found"}`). Under `vercel dev`, paths outside the prefix go to the next rewrite and never reach Haumea.
+  - When deployed, an unmatched path inside the prefix gets Vercel's `NOT_FOUND` page (§2.1), because no function runs. Clients should rely on the status, not the 404 body.
 
 ### 2.3 Build output
 
+- **Location.** In services mode, `haumea build` still writes a complete, self-contained tree to `.vercel/output` in the service root, and the Vercel CLI moves it into `.vercel/output/services/<name>/` (§2.1). Haumea never writes into `services/` itself.
 - **Function paths.** They are prefixed: `app/users/route.py` becomes `functions/api/users.func`, and `app/route.py` becomes `functions/api.func`. Only an unprefixed root route is named `index`.
 - **Static files.** `public/` is copied to `static/<base_path>/`. Docs are written to `static/<base_path>/docs.html` and `static/<base_path>/openapi.json`.
 - **Rewrites.** Each dynamic route pattern and the `<base_path>/docs` rewrite include the prefix. The `{"handle": "filesystem"}` entry stays first.
@@ -84,7 +170,10 @@ The split keeps tree-shaking, monorepo support and future function kinds (static
 
 ### 3.2 CLI changes
 
-- **`--output <dir>`.** Defaults to `.vercel/output` in the project dir.
+- **`--output <dir>`.** Defaults to `.vercel/output` in the project dir. Service builds must keep the default, because `@vercel/static-build` only looks there (§2.1). A custom directory is for tests and for standalone workflows that build once and deploy later, such as CI building into an artifact directory.
+  - `vercel deploy --prebuilt` only reads `.vercel/output` in the linked project directory and takes no output-path option. A standalone workflow must stage the custom tree there first: link the project (`vercel link` or `vercel pull`, which writes `.vercel/project.json`), replace `.vercel/output` with the custom directory (`rm -rf .vercel/output && cp -R <dir> .vercel/output`), then run `vercel deploy --prebuilt`. `<dir>` must lie outside `.vercel/output` (for example `dist/vercel-output`), or the `rm -rf` deletes the source before `cp` reads it.
+  - `cp -R` breaks the hard links between functions, so the staged copy uses more disk. The deployed result is the same.
+  - Haumea doesn't stage or deploy; the workflow owns those steps.
 - **Locked lockfile.** The build runs `uv export` with `--locked`, so a stale `uv.lock` fails the build instead of being re-resolved.
 - **Deterministic output.** Build output contains no timestamps, and files and JSON keys are written in stable order. This lets Turborepo and remote caches key on it.
 
@@ -168,8 +257,10 @@ These distributions and their closures are always bundled:
 
 The build checks that each function's entrypoint actually imports.
 
-- **When it runs.** Only when the vendored target matches the host: same OS and architecture, and the same Python minor version as `--python`. Vercel's build machines are Linux x86_64, so deployed builds always run it.
-- **How it runs.** `python -I` in a fresh subprocess, with only the function directory and its `_vendor/` on `sys.path`.
+- **Interpreter.** The check runs under the target interpreter, not the one running `haumea build`. The build resolves it with `uv python find <--python>`. `sys.executable` is used only if it already has the target minor version. The spike shows why: `uv run` chose CPython 3.14 for the build while the functions target 3.12 (§2.1).
+- **When it runs.** When the host OS and architecture match `--platform` (or `--platform native` is used) and a target-minor interpreter is found. Otherwise the build prints that the check was skipped and why.
+- **On Vercel.** Build machines are Linux x86_64, which matches the default platform. Whether a 3.12 interpreter is already in the build image is unverified, so projects pin it: a `.python-version` with the target minor (`3.12`) in the service root makes `uv run` install that interpreter and run the build on it. `examples/fullstack` (plan step 1.6) ships this pin. Without the pin, the check runs only if `uv python find` locates a 3.12 interpreter, and otherwise it is skipped with the message above.
+- **How it runs.** `<interpreter> -I` in a fresh subprocess, with only the function directory and its `_vendor/` on `sys.path`.
 - **Failure.** An `ImportError` fails the build. The error names the function and the missing module, and suggests `include`.
 - **Otherwise.** The build prints that the check was skipped.
 
@@ -285,7 +376,7 @@ Each request runs through these layers, outermost first:
 
 - **Middleware sees a response.** Handler and dependency errors have already become a `Response` by the time middleware inspects it.
 - **Middleware errors.** An exception raised by middleware itself skips `error.py` and gets the default mapping.
-- **Unmatched paths.** The layers run only after a path matches. A path with no route never reaches a deployed function, so in dev it returns 404 without running any segment file.
+- **Unmatched paths.** The layers run only after a path matches. A path with no route never reaches a deployed function, so in dev it returns Haumea's JSON 404 without running any segment file. The deployed response is Vercel's `NOT_FOUND` page instead (§2.2, dev parity).
 - **405s.** A 405 runs through the matched route's chain, as it does in production.
 - **Parity.** `create_app` and `create_route_app` build the same per-route chain.
 
@@ -307,6 +398,12 @@ These items stay in [serverless-design.md](serverless-design.md):
 
 ## 9. Open questions
 
-1. **Service build handoff.** How does a service with a custom `buildCommand` hand Vercel a prebuilt Build Output tree, and what does `vercel dev` expect from its `devCommand`? Is `VERCEL_SERVICE_ROUTE_PREFIX_STRIP` ever set under the `services` model? The spike in Phase 1 answers these.
+1. **Service build handoff.** *Resolved by the 1.1 spike; details are in §2.1.*
+   - **Build.** The service sets a static-build `framework` such as `"vite"` and `buildCommand: "uv run --frozen haumea build"`, and writes Build Output v3 to `<service root>/.vercel/output`. The CLI moves that tree into `.vercel/output/services/<name>/`. Haumea's `config.json` routes and `.vc-config.json` files are preserved; the CLI applies `.vercelignore` to `static/` and adds an empty `crons` field.
+   - **Dev.** `vercel dev` runs `devCommand` in the service root with `$PORT` set and proxies the original, unstripped path.
+   - **Prefix.** `VERCEL_SERVICE_ROUTE_PREFIX_STRIP` is never set under `services`, so Haumea must route the full prefixed path itself. This holds for a rewrite without `destination.path` or a service `request.path` transform.
+   - **Evidence.** Checked with `vercel build`, `vercel dev --local` and a real `vercel deploy`, and backed by reading the CLI 65.12.1, `@vercel/static-build` 27.0.0 and `@vercel/python` 31.0.0 sources.
+   - **Read from source only.** That `outputDirectory` does not change the lookup path, and that `@vercel/python` cannot consume Build Output.
+   - **Follow-up.** The `"vite"` framework slug is a workaround. Ask Vercel whether `services` will get a builder-neutral way to declare a prebuilt Build Output service.
 2. **`uv export --package` in a workspace.** Does `--no-emit-project` combined with `--package` drop exactly the selected package? A workspace fixture in Phase 1 checks this.
 3. **`vercel-functions` import path.** Does the split package keep the `vercel.functions` import path? Check when it is published.
