@@ -89,7 +89,7 @@ class Haumea:
         except Exception:
             traceback.print_exc(file=sys.stderr)
             response = PlainTextResponse("Internal Server Error", 500)
-        await response(send, include_body=request.method != "HEAD")
+        await response(receive, send, include_body=request.method != "HEAD")
 
     async def _handle(self, request: Request) -> Response:
         """Match in Build Output order: literal routes, then docs and

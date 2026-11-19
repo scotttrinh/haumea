@@ -169,3 +169,35 @@ Verify [[src/haumea/build.py#_check_function_imports]] executes the interpreter 
 Verify `haumea build --explain <function>` (via [[src/haumea/cli.py#main]] and [[src/haumea/build.py#build]]) prints reason chains for included distributions and lists excluded ones.
 
 Covers direct and helper-file traced imports, multi-hop transitive `Requires-Dist` chains, always-included packages and their dependencies, route and project `include`, excluded distributions omitted from `_vendor/`, `.func` suffix normalization, `tree_shake = false`, and `ValueError` on unknown function names without modifying an existing output directory.
+
+## Streaming responses
+
+Verify [[src/haumea/responses.py#StreamingResponse]] sends async-generator, sync-generator and list chunks in order (`str` encoded as UTF-8), with `more_body: True` on each and a final empty body.
+
+No `content-length` is sent even when the caller passes `Content-Length`. `HEAD` sends headers and an empty final body without calling `__iter__`/`__aiter__`, for `SSEResponse` too.
+
+## Streaming disconnect
+
+Verify an `http.disconnect` from `receive` during an endless stream cancels the producer and closes both async and sync generators (their `finally` runs), with chunks still sent in order and no final `more_body: False` message.
+
+## SSE framing
+
+Verify [[src/haumea/responses.py#SSEResponse]] headers and framing for `ServerSentEvent` fields, multi-line data, and `str`, dict and `msgspec.Struct` events.
+
+Also covers raw `None` as `data: null` versus data-less `ServerSentEvent`s, `: ping` lines while the source is idle, sync iterables, and `ValueError` for newlines in `event`/`id`.
+
+## Streaming fast producer disconnect
+
+Verify a disconnect that becomes ready after the first chunk stops a 10,000-chunk producer early even when neither the producer nor `send` suspends, and the generator is closed.
+
+## Streaming receive errors
+
+Verify an exception raised by `receive()` while streaming closes the producer and propagates out of the response instead of returning normally.
+
+## Streaming cancellation during cleanup
+
+Verify that cancelling the request while a disconnect is closing the producer waits for the producer's `finally` to finish, then raises `CancelledError` rather than `RuntimeError` from `aclose()`.
+
+## SSE headers and ping validation
+
+Verify [[src/haumea/responses.py#SSEResponse]] always sends `content-type: text/event-stream` and `cache-control: no-cache` over caller headers, and rejects zero, negative and non-finite `ping` with `ValueError`.

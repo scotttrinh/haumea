@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+import math
+import re
+from collections.abc import AsyncIterable, AsyncIterator, Coroutine, Iterable
 from typing import Any
 
 import msgspec
 
-from haumea.requests import Send
+from haumea.requests import Message, Receive, Send
+
+
+def _header_dict(
+    headers: dict[str, str] | None, media_type: str | None
+) -> dict[str, str]:
+    """Lower-case ``headers``, adding ``content-type`` from ``media_type``
+    (with ``charset=utf-8`` for ``text/*``) unless one was given."""
+    result = {key.lower(): value for key, value in (headers or {}).items()}
+    if media_type and "content-type" not in result:
+        if media_type.startswith("text/"):
+            media_type += "; charset=utf-8"
+        result["content-type"] = media_type
+    return result
 
 
 class Response:
@@ -19,12 +36,7 @@ class Response:
     ) -> None:
         self.status_code = status_code
         self.body = self.render(content)
-        self.headers = {key.lower(): value for key, value in (headers or {}).items()}
-        media_type = media_type or self.media_type
-        if media_type and "content-type" not in self.headers:
-            if media_type.startswith("text/"):
-                media_type += "; charset=utf-8"
-            self.headers["content-type"] = media_type
+        self.headers = _header_dict(headers, media_type or self.media_type)
         self.headers["content-length"] = str(len(self.body))
 
     def render(self, content: Any) -> bytes:
@@ -32,18 +44,20 @@ class Response:
             return b""
         return content if isinstance(content, bytes) else str(content).encode()
 
-    async def __call__(self, send: Send, *, include_body: bool = True) -> None:
-        headers = [
-            (key.encode("latin-1"), value.encode("latin-1"))
-            for key, value in self.headers.items()
-        ]
-        await send(
-            {
-                "type": "http.response.start",
-                "status": self.status_code,
-                "headers": headers,
-            }
-        )
+    def _start_message(self) -> Message:
+        return {
+            "type": "http.response.start",
+            "status": self.status_code,
+            "headers": [
+                (key.encode("latin-1"), value.encode("latin-1"))
+                for key, value in self.headers.items()
+            ],
+        }
+
+    async def __call__(
+        self, receive: Receive, send: Send, *, include_body: bool = True
+    ) -> None:
+        await send(self._start_message())
         body = self.body if include_body else b""
         await send({"type": "http.response.body", "body": body})
 
@@ -68,3 +82,219 @@ class PlainTextResponse(Response):
 class RedirectResponse(Response):
     def __init__(self, url: str, status_code: int = 307) -> None:
         super().__init__(status_code=status_code, headers={"location": url})
+
+
+_DONE: Any = object()
+
+
+class _ThreadedIterator:
+    """Advance a sync iterator in a worker thread, as an async iterator.
+
+    Cancelling ``__anext__`` leaves the in-flight ``next()`` running (threads
+    cannot be interrupted); ``aclose`` waits for it before closing, since a
+    generator cannot be closed while it is executing.
+    """
+
+    def __init__(self, iterable: Iterable[Any]) -> None:
+        self._iterator = iter(iterable)
+        self._pending: asyncio.Future[Any] | None = None
+
+    def __aiter__(self) -> _ThreadedIterator:
+        return self
+
+    async def __anext__(self) -> Any:
+        self._pending = asyncio.ensure_future(
+            asyncio.to_thread(next, self._iterator, _DONE)
+        )
+        item = await asyncio.shield(self._pending)
+        self._pending = None
+        if item is _DONE:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        if self._pending is not None:
+            await asyncio.wait([self._pending])
+        if close := getattr(self._iterator, "close", None):
+            await asyncio.to_thread(close)
+
+
+def _async_iterator(content: AsyncIterable[Any] | Iterable[Any]) -> AsyncIterator[Any]:
+    if isinstance(content, AsyncIterable):
+        return aiter(content)
+    return _ThreadedIterator(content)
+
+
+async def _aclose(iterator: AsyncIterator[Any]) -> None:
+    if aclose := getattr(iterator, "aclose", None):
+        await aclose()
+
+
+async def _stop(iterator: AsyncIterator[Any], *tasks: asyncio.Future[Any]) -> None:
+    """Cancel ``tasks`` and wait for them to stop before closing ``iterator``:
+    an async generator cannot be closed while a task is still running it."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.wait(tasks)
+    await _aclose(iterator)
+
+
+async def _run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
+    """Await ``cleanup`` even if the caller is cancelled meanwhile, then
+    re-raise that ``CancelledError``."""
+    task = asyncio.ensure_future(cleanup)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    task.result()
+
+
+class StreamingResponse(Response):
+    """Stream ``content``, an async or sync iterable of ``bytes`` or ``str``.
+
+    No ``content-length`` is sent. A client disconnect cancels the producer
+    and closes the iterator.
+    """
+
+    def __init__(
+        self,
+        content: AsyncIterable[bytes | str] | Iterable[bytes | str],
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers = _header_dict(headers, media_type or self.media_type)
+        self.headers.pop("content-length", None)
+
+    async def __call__(
+        self, receive: Receive, send: Send, *, include_body: bool = True
+    ) -> None:
+        await send(self._start_message())
+        if not include_body:
+            # Never touch the content, so a HEAD costs no producer work.
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return
+        iterator = _async_iterator(self.content)
+        stream = asyncio.ensure_future(self._stream(iterator, send))
+        listen = asyncio.ensure_future(self._listen_for_disconnect(receive))
+        try:
+            await asyncio.wait([stream, listen], return_when="FIRST_COMPLETED")
+        finally:
+            await _run_to_completion(_stop(iterator, stream, listen))
+        for task in (stream, listen):
+            if not task.cancelled() and (error := task.exception()):
+                raise error
+
+    @staticmethod
+    async def _stream(iterator: AsyncIterator[bytes | str], send: Send) -> None:
+        async for chunk in iterator:
+            body = chunk.encode() if isinstance(chunk, str) else bytes(chunk)
+            await send({"type": "http.response.body", "body": body, "more_body": True})
+            # Yield even if the producer and `send` never suspend, so the
+            # disconnect listener gets to run.
+            await asyncio.sleep(0)
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    @staticmethod
+    async def _listen_for_disconnect(receive: Receive) -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+
+class ServerSentEvent(msgspec.Struct):
+    """One SSE event. ``data`` that is not a ``str`` is JSON-encoded, so
+    ``None`` is ``null``; leave ``data`` unset for an event without data."""
+
+    data: Any = msgspec.UNSET
+    event: str | None = None
+    id: str | None = None
+    retry: int | None = None
+
+    def __post_init__(self) -> None:
+        for field in ("event", "id"):
+            value = getattr(self, field)
+            if value is not None and ("\n" in value or "\r" in value):
+                raise ValueError(f"SSE {field} must not contain a newline")
+
+    def encode(self) -> bytes:
+        """The event's wire framing, ending in a blank line."""
+        lines = [
+            f"{field}: {value}"
+            for field in ("event", "id", "retry")
+            if (value := getattr(self, field)) is not None
+        ]
+        if self.data is not msgspec.UNSET:
+            data = self.data
+            if not isinstance(data, str):
+                data = msgspec.json.encode(data).decode()
+            lines.extend(f"data: {line}" for line in re.split(r"\r\n|\r|\n", data))
+        return ("\n".join(lines) + "\n\n").encode()
+
+
+_PING = b": ping\n\n"
+
+
+class SSEResponse(StreamingResponse):
+    """Server-sent events from an async or sync iterable.
+
+    Each event is a ``ServerSentEvent``, a ``str`` (the data) or any value
+    ``msgspec`` can JSON-encode. With ``ping``, a comment line is sent every
+    ``ping`` seconds to keep the connection alive.
+    """
+
+    def __init__(
+        self,
+        events: AsyncIterable[Any] | Iterable[Any],
+        ping: float | None = None,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        if ping is not None and not (math.isfinite(ping) and ping > 0):
+            raise ValueError(
+                f"SSE ping must be a positive number of seconds, not {ping}"
+            )
+        headers = {key.lower(): value for key, value in (headers or {}).items()}
+        headers["content-type"] = "text/event-stream"
+        headers["cache-control"] = "no-cache"
+        super().__init__(self._frames(events, ping), status_code, headers)
+
+    @staticmethod
+    async def _frames(
+        events: AsyncIterable[Any] | Iterable[Any], ping: float | None
+    ) -> AsyncIterator[bytes]:
+        iterator = _async_iterator(events)
+        loop = asyncio.get_running_loop()
+        next_ping = None if ping is None else loop.time() + ping
+        pending: asyncio.Future[Any] | None = None
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(anext(iterator))
+                timeout = None if next_ping is None else max(next_ping - loop.time(), 0)
+                done, _ = await asyncio.wait([pending], timeout=timeout)
+                if not done:
+                    assert ping is not None and next_ping is not None
+                    next_ping += ping
+                    yield _PING
+                    continue
+                try:
+                    event = pending.result()
+                except StopAsyncIteration:
+                    return
+                finally:
+                    pending = None
+                if not isinstance(event, ServerSentEvent):
+                    event = ServerSentEvent(data=event)
+                yield event.encode()
+        finally:
+            if pending is not None:
+                pending.cancel()
+                await asyncio.wait([pending])
+            await _aclose(iterator)
