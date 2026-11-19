@@ -4,11 +4,11 @@ Haumea infers each handler parameter's source, coercion rules, and dependencies 
 
 ## Source Inference
 
-[[src/haumea/params.py#_field]] classifies each parameter of a handler or dependency into one of six sources (`path`, `query`, `header`, `body`, `request`, `depends`).
+[[src/haumea/params.py#_field]] classifies each parameter of a handler or dependency into one of seven sources (`path`, `query`, `header`, `cookie`, `body`, `request`, `depends`).
 
 1. [[src/haumea/params.py#Depends]] (as default or inside `Annotated`) creates a recursive [[src/haumea/params.py#Endpoint]] (`depends`).
 2. A [[src/haumea/requests.py#Request]] annotation receives the raw request (`request`).
-3. Explicit [[src/haumea/params.py#Query]], [[src/haumea/params.py#Header]], or [[src/haumea/params.py#Body]] markers override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set.
+3. Explicit [[src/haumea/params.py#Query]], [[src/haumea/params.py#Header]], [[src/haumea/params.py#Cookie]], or [[src/haumea/params.py#Body]] markers override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set.
 4. A parameter name matching a route `{segment}` comes from `path`.
 5. A model type ([[src/haumea/params.py#_is_model]]: `msgspec.Struct`, `dataclass`, or `attrs` class) comes from `body`.
 6. Everything else defaults to `query`.
@@ -19,7 +19,7 @@ Haumea infers each handler parameter's source, coercion rules, and dependencies 
 
 - **Single body field**: Decodes and validates raw request bytes directly into the field's annotation via [[src/haumea/params.py#_decode_body]] in a single `msgspec.json.decode` pass.
 - **Multiple body fields**: Decodes the request body once as `dict[str, Any]` and validates each field by alias using `strict=True` in [[src/haumea/params.py#_convert]].
-- **Path, query, and header**: Values arrive as strings, so [[src/haumea/params.py#_convert]] runs `msgspec.convert(..., strict=False)` for lenient coercion (e.g. `"7"` -> `int`). Non-list query parameters take the last value when repeated.
+- **Path, query, header, and cookie**: Values arrive as strings, so [[src/haumea/params.py#_convert]] runs `msgspec.convert(..., strict=False)` for lenient coercion (e.g. `"7"` -> `int`). Non-list query parameters take the last value when repeated. Cookie fields read [[src/haumea/requests.py#Request#cookies]] by `alias` (the parameter name unless set), and OpenAPI documents them as `in: cookie`.
 
 ## Dependencies and Execution
 
@@ -32,3 +32,9 @@ Dependencies are cached in a per-request dictionary keyed by `field.dependency.f
 All conversion and decoding failures are collected into a list of `{"loc": [...], "msg": ...}` dictionaries and raised as [[src/haumea/exceptions.py#RequestValidationError]] (`422`).
 
 [[src/haumea/params.py#_error]] parses `msgspec`'s `- at $.path` error suffix and appends object keys and array indices to `loc`, giving field-level error locations even for nested `Struct` constraints.
+
+## Request Cookies
+
+[[src/haumea/requests.py#Request#cookies]] parses every `cookie` request header into a `dict[str, str]`, which `Cookie()` parameters read from.
+
+Each `;`-separated pair splits on its first `=`, so values may contain `=`; names and values are stripped, and pairs without `=` or a name are skipped. [[src/haumea/requests.py#_unquote]] reverses `http.cookies` quoting (surrounding quotes, backslash and `\ooo` octal escapes), so values written by [[src/haumea/responses.py#Response#set_cookie]] round-trip. When a name repeats the first value wins, since browsers send the most specific path first.

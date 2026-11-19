@@ -4,6 +4,18 @@ Response classes are ASGI callables that [[src/haumea/app.py#Haumea#__call__]] i
 
 [[src/haumea/responses.py#Response#__call__]] takes `receive` as well as `send`, so streaming responses can watch for a client disconnect. Buffered responses ([[src/haumea/responses.py#Response]], [[src/haumea/responses.py#JSONResponse]], [[src/haumea/responses.py#HTMLResponse]], [[src/haumea/responses.py#PlainTextResponse]], [[src/haumea/responses.py#RedirectResponse]]) render their body up front and send a `content-length`.
 
+## Headers and Cookies
+
+`Response.headers` stays a single-valued, lower-cased dict; `set-cookie` headers are kept apart by the private [[src/haumea/responses.py#Response#_append_header]] and sent after it.
+
+The multi-value store is private so it cannot bypass framing (for example, a second `content-length`); only `set_cookie` writes to it. [[src/haumea/responses.py#Response#_init_headers]] sets up both stores for buffered and streaming responses alike, so `JSONResponse`, `StreamingResponse` and `SSEResponse` can set cookies too. [[src/haumea/responses.py#Response#_start_message]] emits the dict entries, then each `set-cookie` as its own tuple.
+
+[[src/haumea/responses.py#Response#set_cookie]] builds the header with `http.cookies`, quoting values as needed. Defaults are secure (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`); browsers accept `Secure` cookies on `localhost`, so dev still works. `expires` takes a datetime (naive means UTC), seconds from now, or a date string.
+
+Everything is validated when `set_cookie` is called, so a bad cookie fails in the handler (a `500`) rather than while headers are being sent. The value must be Latin-1 text ([[src/haumea/responses.py#_is_latin_1]]), which `http.cookies` escapes to ASCII; other text must be encoded by the caller. `path`, `domain` and a string `expires` must match [[src/haumea/responses.py#_COOKIE_ATTRIBUTE]] (printable ASCII without `;`), which also blocks attribute and header injection. An invalid name or `samesite` raises `ValueError` too.
+
+[[src/haumea/responses.py#Response#delete_cookie]] takes only `key`, `path` and `domain`, as specified. It sets an empty value with `Max-Age=0` and a 1970 `expires`, keeping `set_cookie`'s `Secure; HttpOnly; SameSite=Lax`, since browsers can ignore a non-`Secure` overwrite of a `Secure` cookie. `path` and `domain` must match the original.
+
 ## Streaming
 
 [[src/haumea/responses.py#StreamingResponse]] streams an async or sync iterable of `bytes` or `str` chunks, with `more_body: True` on each chunk and no `content-length`, even a caller-supplied one.

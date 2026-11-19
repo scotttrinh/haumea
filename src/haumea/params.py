@@ -6,7 +6,7 @@
 - ``Depends(fn)`` is the result of calling ``fn``, resolved the same way
 - anything else is a query parameter
 
-``Query()``, ``Header()`` and ``Body()`` override the inferred source.
+``Query()``, ``Header()``, ``Cookie()`` and ``Body()`` override the inferred source.
 """
 
 from __future__ import annotations
@@ -54,6 +54,10 @@ def Header(default: Any = ..., *, alias: str | None = None) -> Any:
     return ParamInfo("header", default, alias)
 
 
+def Cookie(default: Any = ..., *, alias: str | None = None) -> Any:
+    return ParamInfo("cookie", default, alias)
+
+
 def Body(default: Any = ..., *, alias: str | None = None) -> Any:
     return ParamInfo("body", default, alias)
 
@@ -61,7 +65,7 @@ def Body(default: Any = ..., *, alias: str | None = None) -> Any:
 @dataclass
 class Field:
     name: str
-    source: str  # path | query | header | body | request | depends
+    source: str  # path | query | header | cookie | body | request | depends
     alias: str
     annotation: Any  # as written, including any Annotated[..., Meta(...)]
     default: Any = _MISSING
@@ -141,11 +145,14 @@ class Endpoint:
                 )
                 kwargs[field.name] = _convert(field, raw, strict=True, errors=errors)
             else:
-                # Path, query and header values are strings: convert leniently.
+                # Path, query, header and cookie values are strings: convert
+                # leniently.
                 if field.source == "path":
                     raw = request.path_params.get(field.alias, _MISSING)
                 elif field.source == "header":
                     raw = request.headers.get(field.alias.lower(), _MISSING)
+                elif field.source == "cookie":
+                    raw = request.cookies.get(field.alias, _MISSING)
                 else:
                     values = request.query_params.get(field.alias)
                     raw = values or _MISSING

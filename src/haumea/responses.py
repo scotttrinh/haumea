@@ -4,7 +4,10 @@ import asyncio
 import math
 import re
 from collections.abc import AsyncIterable, AsyncIterator, Coroutine, Iterable
-from typing import Any
+from datetime import UTC, datetime
+from email.utils import format_datetime
+from http.cookies import CookieError, SimpleCookie
+from typing import Any, Literal
 
 import msgspec
 
@@ -24,7 +27,26 @@ def _header_dict(
     return result
 
 
+_SAMESITE = ("lax", "strict", "none")
+_EPOCH = "Thu, 01 Jan 1970 00:00:00 GMT"
+_COOKIE_ATTRIBUTE = re.compile(r"[\x20-\x3a\x3c-\x7e]*")
+
+
+def _is_latin_1(text: str) -> bool:
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 class Response:
+    """A buffered response.
+
+    ``headers`` holds one value per name. Headers that repeat, such as
+    ``set-cookie``, go through ``_append_header`` and are sent after them.
+    """
+
     media_type: str | None = None
 
     def __init__(
@@ -36,8 +58,85 @@ class Response:
     ) -> None:
         self.status_code = status_code
         self.body = self.render(content)
-        self.headers = _header_dict(headers, media_type or self.media_type)
+        self._init_headers(headers, media_type)
         self.headers["content-length"] = str(len(self.body))
+
+    def _init_headers(
+        self, headers: dict[str, str] | None, media_type: str | None
+    ) -> None:
+        self.headers = _header_dict(headers, media_type or self.media_type)
+        self._appended_headers: list[tuple[str, str]] = []
+
+    def _append_header(self, key: str, value: str) -> None:
+        """Send another ``key`` header, keeping any already set."""
+        self._appended_headers.append((key.lower(), value))
+
+    def set_cookie(
+        self,
+        key: str,
+        value: str = "",
+        *,
+        max_age: int | None = None,
+        expires: datetime | int | str | None = None,
+        path: str | None = "/",
+        domain: str | None = None,
+        secure: bool = True,
+        httponly: bool = True,
+        samesite: Literal["lax", "strict", "none"] | None = "lax",
+    ) -> None:
+        """Add a ``set-cookie`` header; each call adds another.
+
+        ``value`` may be any Latin-1 text and is quoted as needed; encode
+        other text yourself (for example with ``urllib.parse.quote``).
+        ``path``, ``domain`` and a string ``expires`` must be printable ASCII
+        without ``;``. ``expires`` is a datetime (naive means UTC), seconds
+        from now, or an HTTP date string. Anything invalid raises
+        ``ValueError``.
+        """
+        if not _is_latin_1(value):
+            raise ValueError(f"cookie value must be Latin-1 text, not {value!r}")
+        cookie: SimpleCookie = SimpleCookie()
+        try:
+            cookie[key] = value
+        except CookieError as exc:
+            raise ValueError(f"invalid cookie name {key!r}") from exc
+        morsel = cookie[key]
+        if max_age is not None:
+            morsel["max-age"] = max_age
+        if isinstance(expires, datetime):
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=UTC)
+            expires = format_datetime(expires.astimezone(UTC), usegmt=True)
+        for attribute, setting in (
+            ("expires", expires),
+            ("path", path),
+            ("domain", domain),
+        ):
+            if setting is None:
+                continue
+            if isinstance(setting, str) and not _COOKIE_ATTRIBUTE.fullmatch(setting):
+                raise ValueError(
+                    f"cookie {attribute} must be printable ASCII without ';', "
+                    f"not {setting!r}"
+                )
+            morsel[attribute] = setting
+        morsel["secure"] = secure
+        morsel["httponly"] = httponly
+        if samesite is not None:
+            if samesite.lower() not in _SAMESITE:
+                raise ValueError(
+                    f"samesite must be one of {_SAMESITE} or None, not {samesite!r}"
+                )
+            morsel["samesite"] = samesite.capitalize()
+        self._append_header("set-cookie", morsel.OutputString())
+
+    def delete_cookie(
+        self, key: str, *, path: str | None = "/", domain: str | None = None
+    ) -> None:
+        """Expire cookie ``key``; ``path`` and ``domain`` must match the ones
+        it was set with. It keeps ``set_cookie``'s default flags, since a
+        browser may ignore a non-``Secure`` overwrite of a ``Secure`` cookie."""
+        self.set_cookie(key, max_age=0, expires=_EPOCH, path=path, domain=domain)
 
     def render(self, content: Any) -> bytes:
         if content is None:
@@ -50,7 +149,7 @@ class Response:
             "status": self.status_code,
             "headers": [
                 (key.encode("latin-1"), value.encode("latin-1"))
-                for key, value in self.headers.items()
+                for key, value in [*self.headers.items(), *self._appended_headers]
             ],
         }
 
@@ -170,7 +269,7 @@ class StreamingResponse(Response):
     ) -> None:
         self.status_code = status_code
         self.content = content
-        self.headers = _header_dict(headers, media_type or self.media_type)
+        self._init_headers(headers, media_type)
         self.headers.pop("content-length", None)
 
     async def __call__(

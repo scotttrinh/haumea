@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 from urllib.parse import parse_qs
@@ -9,6 +10,18 @@ Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
+
+_COOKIE_ESCAPE = re.compile(r"\\(?:([0-3][0-7]{2})|(.))")
+
+
+def _unquote(value: str) -> str:
+    """Undo the quoting ``http.cookies`` applies to values: surrounding
+    double quotes, backslash escapes and ``\\ooo`` octal escapes."""
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return value
+    return _COOKIE_ESCAPE.sub(
+        lambda m: chr(int(m[1], 8)) if m[1] else m[2], value[1:-1]
+    )
 
 
 class Request:
@@ -46,6 +59,24 @@ class Request:
             key.decode("latin-1").lower(): value.decode("latin-1")
             for key, value in self.scope.get("headers", [])
         }
+
+    @property
+    def cookies(self) -> dict[str, str]:
+        """Cookies from every ``cookie`` header, keyed by name.
+
+        Quoted values are unquoted. When a name repeats, the first value wins:
+        browsers send the cookie with the most specific path first.
+        """
+        cookies: dict[str, str] = {}
+        for key, value in self.scope.get("headers", []):
+            if key.lower() != b"cookie":
+                continue
+            for pair in value.decode("latin-1").split(";"):
+                name, sep, raw = pair.partition("=")
+                name = name.strip()
+                if sep and name and name not in cookies:
+                    cookies[name] = _unquote(raw.strip())
+        return cookies
 
     @property
     def query_params(self) -> dict[str, list[str]]:

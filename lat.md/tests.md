@@ -201,3 +201,29 @@ Verify that cancelling the request while a disconnect is closing the producer wa
 ## SSE headers and ping validation
 
 Verify [[src/haumea/responses.py#SSEResponse]] always sends `content-type: text/event-stream` and `cache-control: no-cache` over caller headers, and rejects zero, negative and non-finite `ping` with `ValueError`.
+
+## Request cookies
+
+Verify [[src/haumea/requests.py#Request#cookies]] for a missing or empty header, several cookies, stray whitespace and `;`, `=` in values, quoted and escaped values, name-less pairs, several `cookie` headers, and first-wins repeats.
+
+## Cookie parameters
+
+Verify `Cookie()` binding in handlers and dependencies with defaults, `alias`, `int` coercion, `422` `loc: ["cookie", name]` errors, the `haumea` export, and OpenAPI `in: cookie` parameters.
+
+## Set-cookie headers
+
+Verify through the ASGI boundary that [[src/haumea/responses.py#Response#set_cookie]] and `delete_cookie` send secure defaults and every attribute, each `set-cookie` as its own raw header tuple after the single-valued headers.
+
+Also covers `ValueError` for a bad name or `samesite`, and `TypeError` for `delete_cookie` keywords beyond the spec's `path` and `domain`.
+
+## Set-cookie on every response type
+
+Verify `JSONResponse`, `StreamingResponse` and `SSEResponse` each send two separate `set-cookie` headers through the ASGI boundary.
+
+## Set-cookie encoding
+
+Verify `set_cookie` rejects non-Latin-1 values, non-ASCII `path`/`domain`/`expires`, and `;` or newlines in attributes with `ValueError`, and that an app doing so sends a complete `500` rather than failing while sending headers.
+
+## Cookie round trip
+
+Verify cookies set through an app, including empty values and ones with spaces, `=`, quotes, backslashes, `;`, `,` and Latin-1 text, come back intact through `Cookie()` and `request.cookies` when sent back.
