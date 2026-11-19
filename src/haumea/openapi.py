@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import inspect
+import json
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -112,19 +114,21 @@ def openapi_schema(app: Haumea) -> dict[str, Any]:
 
 def swagger_html(title: str, openapi_url: str = "/openapi.json") -> str:
     cdn = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5"
+    # A JS string literal that cannot close the inline <script> early.
+    url = json.dumps(openapi_url).replace("<", "\\u003c")
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
+<title>{html.escape(title)}</title>
 <link rel="stylesheet" href="{cdn}/swagger-ui.css">
 </head>
 <body>
 <div id="swagger-ui"></div>
 <script src="{cdn}/swagger-ui-bundle.js"></script>
 <script>
-SwaggerUIBundle({{ url: "{openapi_url}", dom_id: "#swagger-ui" }});
+SwaggerUIBundle({{ url: {url}, dom_id: "#swagger-ui" }});
 </script>
 </body>
 </html>

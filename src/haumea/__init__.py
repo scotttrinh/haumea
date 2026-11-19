@@ -1,4 +1,5 @@
 from haumea.app import Haumea
+from haumea.config import HaumeaConfig, load_config
 from haumea.exceptions import HTTPException, RequestValidationError
 from haumea.params import Body, Depends, Header, Query
 from haumea.requests import Request
@@ -17,6 +18,7 @@ __all__ = [
     "HTMLResponse",
     "HTTPException",
     "Haumea",
+    "HaumeaConfig",
     "Header",
     "JSONResponse",
     "PlainTextResponse",
@@ -27,4 +29,5 @@ __all__ = [
     "Response",
     "create_app",
     "create_route_app",
+    "load_config",
 ]

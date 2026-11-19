@@ -13,6 +13,10 @@
             ├── app/ ...                  project source
             └── _vendor/                  dependencies for the target platform
 
+With ``base_path = "/api"`` in ``[tool.haumea]``, function paths, ``static/``
+files and rewrites are all prefixed: ``functions/api.func``,
+``static/api/docs.html``, ``^/api/docs$``.
+
 Every function carries the same source and dependencies (hard-linked on disk)
 and differs only in its entrypoint and ``.vc-config.json``. The function
 layout mirrors what Vercel's own Python builder produces.
@@ -22,12 +26,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from haumea.config import PYPROJECT, HaumeaConfig, load_config
 from haumea.openapi import swagger_html
 from haumea.routing import Route, create_app, discover_routes
 
@@ -49,7 +55,11 @@ import os
 
 from haumea import create_route_app
 
-app = create_route_app(os.path.join(os.path.dirname(__file__), "app"), {function!r})
+app = create_route_app(
+    os.path.join(os.path.dirname(__file__), "app"),
+    {function!r},
+    base_path={base_path!r},
+)
 """
 
 # Module-level settings a route.py may define, and their .vc-config.json keys.
@@ -162,6 +172,8 @@ class BuildPlan:
     public_dir: Path | None
     """The project's ``public/`` directory, or None if it has none."""
     output_dir: Path
+    config: HaumeaConfig
+    """The project's ``[tool.haumea]`` settings."""
     python: str
     platform: str | None
     functions: tuple[FunctionSpec, ...]
@@ -183,7 +195,7 @@ def _clone_config(value: object) -> object:
     return value
 
 
-def _plan_function(route: Route, python: str) -> FunctionSpec:
+def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
     module = route.load()
     config: dict[str, object] = {
         "runtime": f"python{python}",
@@ -197,24 +209,36 @@ def _plan_function(route: Route, python: str) -> FunctionSpec:
     return FunctionSpec(
         name=route.function,
         route=route,
-        entrypoint=ENTRYPOINT_SOURCE.format(function=route.function),
+        entrypoint=ENTRYPOINT_SOURCE.format(
+            function=route.function, base_path=base_path
+        ),
         vc_config=config,
     )
 
 
-def _plan_static(project_dir: Path, app_dir: Path) -> tuple[StaticFile, ...]:
+def _static_prefix(base_path: str) -> str:
+    """Directory under ``static/`` for ``base_path``: ``""`` or ``"api/"``."""
+    return f"{base_path.lstrip('/')}/" if base_path else ""
+
+
+def _plan_static(
+    project_dir: Path, app_dir: Path, base_path: str
+) -> tuple[StaticFile, ...]:
     """Render the API docs once, at build time, as static files."""
-    app = create_app(app_dir, title=project_dir.name)
+    app = create_app(app_dir, title=project_dir.name, base_path=base_path)
+    prefix = _static_prefix(base_path)
+    openapi_url = f"{base_path}/openapi.json"
     return (
-        StaticFile("openapi.json", json.dumps(app.openapi())),
-        StaticFile("docs.html", swagger_html(app.title)),
+        StaticFile(f"{prefix}openapi.json", json.dumps(app.openapi())),
+        StaticFile(f"{prefix}docs.html", swagger_html(app.title, openapi_url)),
     )
 
 
-def _plan_routes(routes: list[Route]) -> tuple[dict[str, str], ...]:
+def _plan_routes(routes: list[Route], base_path: str) -> tuple[dict[str, str], ...]:
     # Static files and static-path functions are matched by the filesystem
     # check; only dynamic routes need a rewrite to their function.
-    rewrites = [{"src": "^/docs$", "dest": "/docs.html"}]
+    docs = re.escape(f"{base_path}/docs")
+    rewrites = [{"src": f"^{docs}$", "dest": f"{base_path}/docs.html"}]
     rewrites += [
         {"src": route.pattern, "dest": f"/{route.function}"}
         for route in routes
@@ -239,13 +263,16 @@ def plan_build(
     """
     # Discover, before importing any route module.
     project_dir = Path(project_dir).resolve()
-    if not (project_dir / "pyproject.toml").is_file():
+    pyproject = project_dir / PYPROJECT
+    if not pyproject.is_file():
         raise FileNotFoundError(f"no pyproject.toml in {project_dir}")
+    config = load_config(pyproject)
+    base_path = config.base_path
     app_dir = project_dir / "app"
     public: Path | None = project_dir / "public"
     if not public.is_dir():
         public = None
-    routes = discover_routes(app_dir)
+    routes = discover_routes(app_dir, base_path)
 
     # Plan.
     return BuildPlan(
@@ -254,11 +281,12 @@ def plan_build(
         app_dir=app_dir,
         public_dir=public,
         output_dir=project_dir / OUTPUT_DIR,
+        config=config,
         python=python,
         platform=platform,
-        functions=tuple(_plan_function(route, python) for route in routes),
-        static_files=_plan_static(project_dir, app_dir),
-        routes=_plan_routes(routes),
+        functions=tuple(_plan_function(route, python, base_path) for route in routes),
+        static_files=_plan_static(project_dir, app_dir, base_path),
+        routes=_plan_routes(routes, base_path),
     )
 
 
@@ -271,11 +299,14 @@ def _write_function(spec: FunctionSpec, shared: Path, functions_dir: Path) -> No
 
 
 def _write_static(plan: BuildPlan, static_dir: Path) -> None:
+    """Copy ``public/`` to ``static/<base_path>/``, then write the generated
+    files (whose paths already carry the prefix) over it."""
     public_dir = plan.public_dir or (plan.project_dir / "public")
+    public_dest = static_dir / _static_prefix(plan.config.base_path)
     if public_dir.is_dir():
-        shutil.copytree(public_dir, static_dir)
+        shutil.copytree(public_dir, public_dest)
     else:
-        static_dir.mkdir()
+        public_dest.mkdir(parents=True)
     for file in plan.static_files:
         dest = static_dir / file.path
         dest.parent.mkdir(parents=True, exist_ok=True)

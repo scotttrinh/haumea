@@ -26,7 +26,18 @@ class Request:
 
     @property
     def path(self) -> str:
-        return self.scope["path"]
+        """The full public path, ``root_path + path``.
+
+        ``scope["path"]`` is relative to ``scope["root_path"]`` (as
+        ``vercel-runtime``'s prefix strip writes it), so there is no
+        ``startswith`` check. At the prefix root, ``path == "/"``, the full
+        path is ``root_path`` alone.
+        """
+        root_path = self.scope.get("root_path", "").rstrip("/")
+        path = self.scope["path"]
+        if root_path and path == "/":
+            return root_path
+        return f"{root_path}{path}"
 
     @property
     def headers(self) -> dict[str, str]:

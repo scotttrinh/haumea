@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from importlib.util import find_spec
 
 from haumea.build import DEFAULT_PLATFORM, DEFAULT_PYTHON, build
+from haumea.config import PYPROJECT
 
 
 def dev_app():
@@ -37,6 +39,9 @@ def main(argv: list[str] | None = None) -> None:
         import uvicorn
 
         sys.path.insert(0, os.getcwd())
+        # base_path lives in pyproject.toml. Only the watchfiles reloader
+        # honors non-.py patterns; uvicorn warns about them otherwise.
+        includes = ["*.py", PYPROJECT] if find_spec("watchfiles") else None
         uvicorn.run(
             "haumea.cli:dev_app",
             factory=True,
@@ -44,6 +49,7 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             reload=True,
             reload_dirs=[os.getcwd()],
+            reload_includes=includes,
         )
     elif args.command == "build":
         platform = None if args.platform == "native" else args.platform

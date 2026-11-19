@@ -7,21 +7,27 @@ from pathlib import Path
 import httpx
 import pytest
 
+from haumea import (
+    HaumeaConfig,
+    Request,
+    create_app,
+    create_route_app,
+    load_config,
+)
 from haumea import build as build_module
-from haumea import create_app
 from haumea.build import build, emit_build, plan_build
+from haumea.config import normalize_base_path
+from haumea.openapi import swagger_html
+from haumea.routing import discover_routes
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
 AUTH = {"Authorization": "Bearer secret"}
 
 
-@pytest.fixture(scope="module")
-def client():
-    app = create_app(EXAMPLE / "app", public_dir=EXAMPLE / "public")
-
+def make_client(app, root_path: str = ""):
     def request(method: str, url: str, **kwargs) -> httpx.Response:
         async def send():
-            transport = httpx.ASGITransport(app=app)
+            transport = httpx.ASGITransport(app=app, root_path=root_path)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as http:
@@ -30,6 +36,41 @@ def client():
         return asyncio.run(send())
 
     return request
+
+
+def raw_get(app, path: str, root_path: str = "") -> tuple[int, bytes]:
+    """Call ``app`` with an unnormalized ``path``, which httpx would clean up."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "root_path": root_path,
+        "headers": [],
+        "query_string": b"",
+    }
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    body = b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+    return sent[0]["status"], body
+
+
+@pytest.fixture(scope="module")
+def example_app():
+    return create_app(EXAMPLE / "app", public_dir=EXAMPLE / "public")
+
+
+@pytest.fixture(scope="module")
+def client(example_app):
+    return make_client(example_app)
 
 
 # @lat: [[tests#Routes and parameters]]
@@ -92,9 +133,10 @@ def test_body_and_dependencies(client):
 
 
 # @lat: [[tests#Dev docs and static files]]
-def test_dev_docs_and_static_files(client):
+def test_dev_docs_and_static_files(client, example_app):
     assert "static file" in client("GET", "/hello.txt").text
-    assert client("GET", "/../pyproject.toml").status_code == 404
+    assert raw_get(example_app, "/../pyproject.toml")[0] == 404
+    assert raw_get(example_app, "/hello.txt/")[0] == 404
     assert "swagger" in client("GET", "/docs").text.lower()
 
     schema = client("GET", "/openapi.json").json()
@@ -165,8 +207,9 @@ def test_build_plan(tmp_path, isolated_imports):
         "/orders/{order_id}",
     ]
     orders, order = plan.functions
+    assert plan.config == HaumeaConfig()
     assert "create_route_app(" in order.entrypoint
-    assert order.entrypoint.rstrip().endswith("'orders/[order_id]')")
+    assert "'orders/[order_id]',\n    base_path='',\n)" in order.entrypoint
     assert order.vc_config == {
         "runtime": "python3.13",
         "handler": "vc__handler__python.vc_handler",
@@ -344,3 +387,449 @@ def test_built_functions_handle_their_own_route(output):
     # Each function only knows its own route.
     assert invoke(output, "api/hello", "/api/items/42")["statusCode"] == 404
     assert invoke(output, "api/hello", "/docs")["statusCode"] == 404
+
+
+# @lat: [[tests#Project config]]
+def test_project_config(tmp_path):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[project]\nname = "x"\n')
+    assert load_config(pyproject) == HaumeaConfig(
+        base_path="", tree_shake=True, include=()
+    )
+
+    pyproject.write_text(
+        '[tool.haumea]\nbase_path = "api/"\ntree_shake = false\ninclude = ["anyio"]\n'
+    )
+    assert load_config(pyproject) == HaumeaConfig(
+        base_path="/api", tree_shake=False, include=("anyio",)
+    )
+
+    for raw, normalized in [
+        ("", ""),
+        ("/", ""),
+        ("/api/", "/api"),
+        ("/api", "/api"),
+        ("/v1/api", "/v1/api"),
+        ("/v1+/a-b_c.d~e!,;=@", "/v1+/a-b_c.d~e!,;=@"),
+    ]:
+        assert HaumeaConfig(base_path=raw).base_path == normalized
+
+    for table, error in [
+        ("base_pth = '/api'", "unknown field `base_pth`"),
+        ("base_path = 1", "Expected `str`, got `int`"),
+        ("base_path = '/a//b'", "invalid base_path"),
+        ("base_path = '/../up'", "invalid base_path"),
+        ("base_path = '/{x}'", "invalid base_path"),
+        ("base_path = '/a/./b'", "invalid base_path"),
+        ("base_path = '/a\\u0000b'", "invalid base_path"),
+        ("base_path = '/a\\nb'", "invalid base_path"),
+        ("base_path = '/a\\u007fb'", "invalid base_path"),
+        ("base_path = '/a b'", "invalid base_path"),
+        ("base_path = '/a%2fb'", "invalid base_path"),
+        ("base_path = '/a\"b'", "invalid base_path"),
+        ('base_path = "/a\'b"', "invalid base_path"),
+        ("base_path = '/a\\\\b'", "invalid base_path"),
+        ("base_path = '/<script>'", "invalid base_path"),
+        ("base_path = '/a?b'", "invalid base_path"),
+        ("base_path = '/a#b'", "invalid base_path"),
+        ("base_path = '/$1'", "invalid base_path"),
+        ("base_path = '/caf\u00e9'", "invalid base_path"),
+        ("base_path = '/svc.func'", "invalid base_path"),
+        ("base_path = '/v1/svc.func/'", "invalid base_path"),
+        ("tree_shake = 1", "Expected `bool`, got `int`"),
+        ("include = 'anyio'", "Expected `array`, got `str`"),
+        ("include = [1]", "Expected `str`, got `int`"),
+    ]:
+        pyproject.write_text(f"[tool.haumea]\n{table}\n")
+        with pytest.raises(ValueError, match=error):
+            load_config(pyproject)
+
+    for toml, error in [
+        ("tool = true", "`tool` must be a table"),
+        ("[tool]\nhaumea = true", "`tool.haumea` must be a table"),
+    ]:
+        pyproject.write_text(f"{toml}\n")
+        with pytest.raises(ValueError, match=f"invalid \\[tool.haumea\\] .*{error}"):
+            load_config(pyproject)
+
+    with pytest.raises(ValueError, match="invalid base_path"):
+        HaumeaConfig(base_path="/a\x00b")
+    # functions/svc.func would be read as a function, not a directory.
+    with pytest.raises(ValueError, match="invalid base_path"):
+        normalize_base_path("/svc.func")
+    assert normalize_base_path("/svc.funcs/x.func.d") == "/svc.funcs/x.func.d"
+
+
+def test_swagger_html_escapes_title_and_url():
+    page = swagger_html("<b>&", '/x"y</script><!--')
+    assert "<title>&lt;b&gt;&amp;</title>" in page
+    script = page.split("<script>\n", 1)[1].split("\n</script>", 1)[0]
+    assert "<" not in script
+    assert 'url: "/x\\"y\\u003c/script>\\u003c!--"' in script
+    url = script.split("url: ", 1)[1].split(", dom_id", 1)[0]
+    assert json.loads(url) == '/x"y</script><!--'
+
+
+PREFIXED_FILES = {
+    "pyproject.toml": (
+        '[project]\nname = "prefixed"\nversion = "0"\n\n'
+        '[tool.haumea]\nbase_path = "/api/"\n'
+    ),
+    "app/route.py": "def GET():\n    return {'route': 'root'}\n",
+    "app/users/route.py": "def GET():\n    return {'route': 'users'}\n",
+    "app/users/[id]/route.py": (
+        "from haumea import Request\n\n"
+        "def GET(id: int, request: Request):\n"
+        "    return {'id': id, 'path': request.path}\n"
+    ),
+    "public/hello.txt": "prefixed static\n",
+}
+
+
+@pytest.fixture(scope="module")
+def prefixed_project(tmp_path_factory):
+    project = tmp_path_factory.mktemp("prefixed")
+    write_project(project, PREFIXED_FILES)
+    return project
+
+
+# @lat: [[tests#Prefixed dev routing]]
+def test_prefixed_dev_routing(prefixed_project, isolated_imports):
+    # base_path comes from [tool.haumea] beside app/, as in `haumea dev`.
+    app = create_app(prefixed_project / "app", public_dir=prefixed_project / "public")
+    assert app.base_path == "/api"
+    client = make_client(app)
+
+    assert client("GET", "/api").json() == {"route": "root"}
+    assert client("GET", "/api/users").json() == {"route": "users"}
+    assert client("GET", "/api/users/7").json() == {"id": 7, "path": "/api/users/7"}
+    assert client("GET", "/api/hello.txt").text == "prefixed static\n"
+    assert raw_get(app, "/api/../pyproject.toml")[0] == 404
+    assert raw_get(app, "/api/../../pyproject.toml")[0] == 404
+
+    docs = client("GET", "/api/docs").text
+    assert docs == swagger_html("Haumea", "/api/openapi.json")
+    schema = client("GET", "/api/openapi.json").json()
+    assert set(schema["paths"]) == {"/api", "/api/users", "/api/users/{id}"}
+
+    # Outside the prefix (or on its trailing-slash root): Haumea's JSON 404.
+    for path in ["/", "/api/", "/users", "/hello.txt", "/apiary/hello.txt", "/docs"]:
+        response = client("GET", path)
+        assert response.status_code == 404, path
+        assert response.json() == {"detail": "Not Found"}
+
+    # An explicit base_path overrides the config.
+    plain = make_client(create_app(prefixed_project / "app", base_path=""))
+    assert plain("GET", "/users").json() == {"route": "users"}
+
+
+# @lat: [[tests#Root path reconstruction]]
+def test_root_path_reconstruction(prefixed_project, isolated_imports):
+    async def receive():
+        return {"type": "http.request"}
+
+    for root_path, path, full in [
+        ("", "/", "/"),
+        ("", "/api/users", "/api/users"),
+        ("/api", "/", "/api"),
+        ("/api/", "/", "/api"),
+        ("/api", "/users", "/api/users"),
+        ("/api", "/apiary", "/api/apiary"),
+        ("/api", "/api/users", "/api/api/users"),
+    ]:
+        scope = {"path": path, "root_path": root_path}
+        assert Request(scope, receive).path == full
+    assert Request({"path": "/x"}, receive).path == "/x"
+
+    app = create_app(prefixed_project / "app")
+
+    # What vercel-runtime's prefix strip produces for both /api and /api/.
+    assert make_client(app, "/api")("GET", "/").json() == {"route": "root"}
+    # Without a strip, /api/ is a literal miss.
+    assert make_client(app, "")("GET", "/api/").status_code == 404
+    assert make_client(app, "/api")("GET", "/users").json() == {"route": "users"}
+    assert make_client(app, "/api/")("GET", "/users/3").json() == {
+        "id": 3,
+        "path": "/api/users/3",
+    }
+    # No startswith check: a stripped path may itself begin with the prefix.
+    assert make_client(app, "/api")("GET", "/apiary").status_code == 404
+    response = make_client(app, "/api")("GET", "/api/users")
+    assert response.status_code == 404
+
+    route_app = create_route_app(prefixed_project / "app", "api/users/[id]")
+    route_client = make_client(route_app, "/api")
+    assert route_client("GET", "/users/3").json() == {"id": 3, "path": "/api/users/3"}
+    assert route_client("GET", "/").status_code == 404
+    response = route_client("GET", "/api/users/3")
+    assert response.status_code == 404
+    response = route_client("GET", "/apiary/x")
+    assert response.status_code == 404
+
+
+@pytest.fixture(scope="module")
+def prefixed_output(prefixed_project):
+    install = build_module._install_dependencies
+
+    def install_like_example(project_dir, vendor_dir, python, platform):
+        # Same dependencies as examples/hello, which has a lock to export.
+        install(EXAMPLE, vendor_dir, python, platform)
+
+    path, modules = list(sys.path), set(sys.modules)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(build_module, "_install_dependencies", install_like_example)
+            patch.setattr(sys, "dont_write_bytecode", True)
+            return build(prefixed_project, platform=None)
+    finally:
+        sys.path[:] = path
+        for name in set(sys.modules) - modules:
+            del sys.modules[name]
+
+
+# @lat: [[tests#Prefixed build output]]
+def test_prefixed_build_output(prefixed_project, prefixed_output):
+    output = prefixed_output
+    assert output == prefixed_project / ".vercel" / "output"
+
+    config = json.loads((output / "config.json").read_text())
+    assert config["routes"] == [
+        {"handle": "filesystem"},
+        {"src": "^/api/docs$", "dest": "/api/docs.html"},
+        {"src": "^/api/users/([^/]+)$", "dest": "/api/users/[id]"},
+    ]
+
+    static = output / "static"
+    assert {p.relative_to(static).as_posix() for p in static.rglob("*")} == {
+        "api",
+        "api/hello.txt",
+        "api/docs.html",
+        "api/openapi.json",
+    }
+    docs = (static / "api" / "docs.html").read_text()
+    assert docs == swagger_html(prefixed_project.name, "/api/openapi.json")
+    schema = json.loads((static / "api" / "openapi.json").read_text())
+    assert set(schema["paths"]) == {"/api", "/api/users", "/api/users/{id}"}
+
+    functions = output / "functions"
+    assert {p.relative_to(functions).as_posix() for p in functions.rglob("*.func")} == {
+        "api.func",
+        "api/users.func",
+        "api/users/[id].func",
+    }
+
+    response = invoke(output, "api", "/api")
+    assert json.loads(response["body"]) == {"route": "root"}
+    response = invoke(output, "api/users/[id]", "/api/users/5")
+    assert json.loads(response["body"]) == {"id": 5, "path": "/api/users/5"}
+    assert invoke(output, "api/users", "/users")["statusCode"] == 404
+
+
+# @lat: [[tests#Dev routing priority]]
+def test_dev_routing_priority(tmp_path, isolated_imports):
+    project = tmp_path / "catchall"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[tool.haumea]\nbase_path = "/api"\n',
+            "app/[...item]/route.py": (
+                "def GET(item: str):\n    return {'item': item}\n"
+            ),
+            "app/docs/route.py": "def POST():\n    return {'route': 'docs'}\n",
+            "app/users/route.py": "def GET():\n    return {'route': 'users'}\n",
+            "public/hello.txt": "static\n",
+            "public/users": "shadowed\n",
+        },
+    )
+    (project / "public" / "loop").symlink_to(project / "public" / "loop")
+    app = create_app(project / "app", public_dir=project / "public")
+    client = make_client(app)
+
+    # The filesystem check and docs rewrite run before dynamic routes.
+    assert client("GET", "/api/hello.txt").text == "static\n"
+    assert client("HEAD", "/api/hello.txt").content == b""
+    assert client("GET", "/api/openapi.json").json()["openapi"] == "3.1.0"
+    assert "swagger" in client("GET", "/api/docs.html").text.lower()
+    # Literal routes still run, ahead of files and docs, like a static-path
+    # function in the filesystem check: GET /api/docs is that function's 405.
+    assert client("GET", "/api/users").json() == {"route": "users"}
+    assert client("POST", "/api/docs").json() == {"route": "docs"}
+    response = client("GET", "/api/docs")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+    # Anything else falls through to the catch-all.
+    assert client("GET", "/api/a/b").json() == {"item": "a/b"}
+    assert client("POST", "/api/a").headers["allow"] == "GET"
+
+    # Directory-style, looping and traversing paths are not files.
+    for path in ["/api/hello.txt/", "/api/loop", "/api/../pyproject.toml"]:
+        status, body = raw_get(app, path)
+        assert status == 200, path
+        assert json.loads(body) == {"item": path.removeprefix("/api/")}
+
+    plain = create_app(project / "app", public_dir=project / "public", base_path="")
+    for path in ["/hello.txt/", "/loop", "/../pyproject.toml", "/a\x00b"]:
+        assert raw_get(plain, path)[0] == 200, path
+    assert raw_get(plain, "/hello.txt")[1] == b"static\n"
+
+
+# @lat: [[tests#Dev docs precedence]]
+def test_dev_docs_precedence(tmp_path, isolated_imports):
+    project = tmp_path / "docsfiles"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[tool.haumea]\nbase_path = "/api"\n',
+            "app/[...item]/route.py": (
+                "def GET(item: str):\n    return {'get': item}\n\n"
+                "def POST(item: str):\n    return {'post': item}\n"
+            ),
+            "public/docs": "static docs\n",
+            "public/docs.html": "stale docs\n",
+            "public/openapi.json": "{}\n",
+        },
+    )
+    app = create_app(project / "app", public_dir=project / "public")
+    client = make_client(app)
+    swagger = swagger_html("Haumea", "/api/openapi.json")
+
+    # public/docs is found by the filesystem check, before the docs rewrite;
+    # the generated docs.html and openapi.json overwrite their public/ copies.
+    assert client("GET", "/api/docs").text == "static docs\n"
+    assert client("GET", "/api/docs.html").text == swagger
+    assert client("GET", "/api/openapi.json").json()["openapi"] == "3.1.0"
+    assert client("HEAD", "/api/docs.html").content == b""
+
+    # Method checks run before generating the schema or reading file bytes.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(app, "openapi", lambda: pytest.fail("openapi() called on POST"))
+        patch.setattr(
+            Path, "read_bytes", lambda self: pytest.fail("read_bytes() called on POST")
+        )
+        # Files and docs answer other methods with 405, not the catch-all.
+        for path in ["/api/docs", "/api/docs.html", "/api/openapi.json"]:
+            response = client("POST", path)
+            assert response.status_code == 405, path
+            assert response.headers["allow"] == "GET, HEAD"
+    assert client("POST", "/api/other").json() == {"post": "other"}
+
+    # Without public/docs, /api/docs is the generated Swagger UI.
+    bare = make_client(create_app(project / "app"))
+    assert bare("GET", "/api/docs").text == swagger
+    assert bare("POST", "/api/docs").headers["allow"] == "GET, HEAD"
+    assert bare("POST", "/api/a/b").json() == {"post": "a/b"}
+
+
+# @lat: [[tests#Route load cache]]
+def test_route_load_cache(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            "app/route.py": "def GET():\n    return {}\n",
+            "app/bad/route.py": "raise RuntimeError('boom')\n",
+        },
+    )
+    plain, prefixed = (
+        {r.url_path: r for r in discover_routes(tmp_path / "app", base)}
+        for base in ["", "/v1"]
+    )
+    # One file under two prefixes is one module.
+    assert plain["/"].function != prefixed["/v1"].function
+    assert plain["/"].load() is prefixed["/v1"].load()
+
+    before = set(sys.modules)
+    for _ in range(2):  # retried, not served from a partial cache entry
+        with pytest.raises(RuntimeError, match="boom"):
+            prefixed["/v1/bad"].load()
+        assert set(sys.modules) == before
+
+
+# @lat: [[tests#Route module isolation]]
+def test_route_module_isolation(tmp_path, isolated_imports):
+    for name in ["one", "two"]:
+        write_project(
+            tmp_path / name,
+            {"app/route.py": f"def GET():\n    return {{'project': {name!r}}}\n"},
+        )
+    for name in ["one", "two"]:
+        response = make_client(create_app(tmp_path / name / "app"))("GET", "/")
+        assert response.json() == {"project": name}
+
+    # "v1+" and "v1+/!" functions: distinct files, distinct modules.
+    project = tmp_path / "punct"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[tool.haumea]\nbase_path = "/v1+"\n',
+            "app/route.py": "def GET():\n    return {'route': 'root'}\n",
+            "app/!/route.py": "def GET():\n    return {'route': 'bang'}\n",
+        },
+    )
+    client = make_client(create_app(project / "app"))
+    assert client("GET", "/v1+").json() == {"route": "root"}
+    assert client("GET", "/v1+/!").json() == {"route": "bang"}
+
+
+# @lat: [[tests#Symlinked app directory]]
+def test_symlinked_app_directory(tmp_path, isolated_imports):
+    project = tmp_path / "linked"
+    write_project(
+        project,
+        {
+            "pyproject.toml": (
+                '[project]\nname = "linked"\nversion = "0"\n\n'
+                '[tool.haumea]\nbase_path = "/api"\n'
+            ),
+            "src/app/users/route.py": "def GET():\n    return {'route': 'users'}\n",
+        },
+    )
+    (project / "app").symlink_to(project / "src" / "app")
+
+    app = create_app(project / "app")
+    assert app.base_path == "/api"
+    assert make_client(app)("GET", "/api/users").json() == {"route": "users"}
+    route_app = create_route_app(project / "app", "api/users")
+    assert route_app.base_path == "/api"
+
+    plan = plan_build(project)
+    assert plan.config.base_path == "/api"
+    assert [f.name for f in plan.functions] == ["api/users"]
+
+
+# @lat: [[tests#Prefixed build without public]]
+def test_prefixed_build_without_public(tmp_path, isolated_imports, monkeypatch):
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    files = {
+        "pyproject.toml": (
+            '[project]\nname = "nopub"\nversion = "0"\n\n'
+            '[tool.haumea]\nbase_path = "/api"\n'
+        ),
+        "app/route.py": "def GET():\n    return {}\n",
+    }
+    project = tmp_path / "nopub"
+    write_project(project, files)
+    static = emit_build(plan_build(project)) / "static"
+    assert {p.relative_to(static).as_posix() for p in static.rglob("*")} == {
+        "api",
+        "api/docs.html",
+        "api/openapi.json",
+    }
+
+    late = tmp_path / "latepub"
+    write_project(
+        late,
+        files
+        | {
+            "app/route.py": (
+                "from pathlib import Path\n"
+                "pub = Path(__file__).parents[1] / 'public'\n"
+                "pub.mkdir(exist_ok=True)\n"
+                "(pub / 'late.txt').write_text('created')\n"
+            )
+        },
+    )
+    plan = plan_build(late)
+    assert plan.public_dir is None
+    static = emit_build(plan) / "static"
+    assert (static / "api" / "late.txt").read_text() == "created"
+    assert (static / "api" / "docs.html").is_file()
