@@ -56,6 +56,14 @@ The default output location is `<project_dir>/.vercel/output` ([[src/haumea/buil
 
 Each [[src/haumea/build.py#FunctionReport]] records the function's measured size and bundled distributions (tree-shaken when `tree_shake` is enabled, or the full store when disabled). Above [[src/haumea/build.py#SIZE_WARN_BYTES]] (up to [[src/haumea/build.py#SIZE_LIMIT_BYTES]]), the build emits a `UserWarning` listing the largest bundled distributions via [[src/haumea/build.py#_format_largest_distributions]]; above [[src/haumea/build.py#SIZE_LIMIT_BYTES]], it raises `RuntimeError` with the oversized functions and their largest distributions.
 
+### Build-Time Import Check
+
+[[src/haumea/build.py#_check_function_imports]] verifies each built function's `index.py` imports cleanly in an isolated target-Python subprocess when the target platform matches the host.
+
+- **Platform gate**: [[src/haumea/build.py#_platform_matches_host]] passes when `plan.platform` is `None` (`--platform native`) or [[src/haumea/build.py#_parse_target_platform]] matches [[src/haumea/build.py#_host_os_arch]]. Otherwise the build prints why the check was skipped and continues.
+- **Target interpreter**: [[src/haumea/build.py#_find_target_python]] runs `uv python find <plan.python>` from `plan.workspace_root` rather than reusing `sys.executable`; if none is found, the build prints a skip message and continues.
+- **Isolated import**: [[src/haumea/build.py#_check_one_function]] runs `<interpreter> -I -S -B` with [[src/haumea/build.py#_IMPORT_CHECK_SCRIPT]] (sharing [[src/haumea/build.py#_VENDOR_SETUP_SOURCE]] with [[src/haumea/build.py#TRAMPOLINE_SOURCE]]) so only stdlib, the function directory, and its `_vendor/` are on `sys.path` and no `__pycache__` files are written. Any `ImportError` (extracted via [[src/haumea/build.py#_parse_import_check_error]]) raises `RuntimeError` naming the function and missing module and suggesting `include`.
+
 ## Per-Route Function Config
 
 Route modules can configure their own Vercel function settings and explicit distribution includes using module-level variables.

@@ -149,3 +149,17 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 Verify [[src/haumea/build.py#trace_function]], [[src/haumea/build.py#resolve_closure]], [[src/haumea/build.py#ALWAYS_INCLUDED]], and [[src/haumea/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
 Covers `vercel-functions` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
+
+## Build-time import check
+
+Verify [[src/haumea/build.py#build]] with `platform=None` fails with a `RuntimeError` naming the function, missing module, and `include` when a route imports a workspace package by computed name, and succeeds once added to route or project `include`.
+
+Also verifies `PYTHONPATH` is ignored by `-I` and no `__pycache__` directories are written into built functions.
+
+## Import check platform matching
+
+Verify [[src/haumea/build.py#_check_function_imports]] skips with a printed message (without invoking `uv python find`) when `plan.platform` does not match the host OS/architecture, and runs when it matches.
+
+## Import check target interpreter
+
+Verify [[src/haumea/build.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.

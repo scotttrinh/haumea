@@ -286,6 +286,7 @@ def test_emit_build_preserves_public_and_config_isolation(
     assert plan.functions[2].vc_config["regions"] == ["cdg1"]
 
     monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
     output = emit_build(plan)
 
     static = output / "static"
@@ -810,6 +811,7 @@ def test_symlinked_app_directory(tmp_path, isolated_imports):
 # @lat: [[tests#Prefixed build without public]]
 def test_prefixed_build_without_public(tmp_path, isolated_imports, monkeypatch):
     monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
     files = {
         "pyproject.toml": (
             '[project]\nname = "nopub"\nversion = "0"\n\n'
@@ -849,6 +851,7 @@ def test_prefixed_build_without_public(tmp_path, isolated_imports, monkeypatch):
 # @lat: [[tests#Custom build output directory]]
 def test_custom_build_output_directory(tmp_path, isolated_imports, monkeypatch, capsys):
     monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
     project = tmp_path / "custom"
     write_project(
         project,
@@ -948,6 +951,7 @@ def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
 # @lat: [[tests#Deterministic build output]]
 def test_deterministic_build_output(tmp_path, isolated_imports, monkeypatch):
     monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
     project = tmp_path / "det"
     write_project(
         project,
@@ -1441,6 +1445,7 @@ def test_build_size_report_and_limits(tmp_path, isolated_imports, monkeypatch, c
         )
 
     monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
 
     # Under thresholds: prints each function's size and distribution count, no warnings.
     with warnings.catch_warnings(record=True) as caught:
@@ -1807,6 +1812,7 @@ def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, c
         write_project(vendor_dir, store_files)
 
     monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
 
     project = tmp_path / "edge"
     write_project(
@@ -1930,3 +1936,245 @@ def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, c
         )
         with pytest.raises(ValueError, match="include"):
             plan_build(bad_proj)
+
+
+# @lat: [[tests#Build-time import check]]
+def test_build_import_check_catches_computed_import(
+    tmp_path, isolated_imports, monkeypatch, capsys
+):
+    repo_root = Path(__file__).parent.parent.resolve()
+    host_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    workspace = tmp_path / "check-ws"
+    write_project(
+        workspace,
+        {
+            "pyproject.toml": (
+                '[tool.uv.workspace]\nmembers = ["apps/*", "packages/*"]\n'
+            ),
+        },
+    )
+    _write_workspace_pkg(
+        workspace, "pkg-a", "pkg_a", 'def value() -> str:\n    return "from-pkg-a"\n'
+    )
+
+    base_pyproject = (
+        '[project]\nname = "api"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.12"\n'
+        'dependencies = ["haumea", "pkg-a"]\n\n'
+        "[tool.uv.sources]\n"
+        f"haumea = {{ path = {json.dumps(repo_root.as_posix())}, editable = true }}\n"
+        "pkg-a = { workspace = true }\n"
+    )
+    computed_route = (
+        "import importlib\n\n"
+        'MOD = importlib.import_module("".join(["pkg", "_a"]))\n\n'
+        "def GET():\n"
+        '    return {"value": MOD.value()}\n'
+    )
+    write_project(
+        workspace / "apps" / "api",
+        {
+            "pyproject.toml": base_pyproject,
+            "app/ok/route.py": 'def GET():\n    return {"ok": True}\n',
+            "app/computed/route.py": computed_route,
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=workspace, check=True)
+    monkeypatch.syspath_prepend(str(workspace / "packages" / "pkg-a" / "src"))
+    monkeypatch.setenv("PYTHONPATH", str(workspace / "packages" / "pkg-a" / "src"))
+
+    api = workspace / "apps" / "api"
+
+    # Without `include`, the computed import is missed by static tracing and
+    # caught by the build-time import check.
+    with pytest.raises(RuntimeError) as exc_info:
+        build(api, python=host_python, platform=None, output=tmp_path / "out-fail")
+    message = str(exc_info.value)
+    assert "computed" in message
+    assert "pkg_a" in message
+    assert "include" in message
+    capsys.readouterr()
+
+    # Adding route-level `include` bundles pkg-a and lets the check pass.
+    (api / "app" / "computed" / "route.py").write_text(
+        'include = ["pkg-a"]\n' + computed_route
+    )
+    for mod_name in [k for k in sys.modules if k.startswith("haumea_routes.")]:
+        sys.modules.pop(mod_name, None)
+    out_route = build(
+        api, python=host_python, platform=None, output=tmp_path / "out-route-inc"
+    )
+    capsys.readouterr()
+    assert not list((out_route / "functions").rglob("__pycache__"))
+    assert json.loads(invoke(out_route, "computed", "/computed")["body"]) == {
+        "value": "from-pkg-a"
+    }
+
+    # Project-level `[tool.haumea] include` also satisfies the check.
+    (api / "app" / "computed" / "route.py").write_text(computed_route)
+    for mod_name in [k for k in sys.modules if k.startswith("haumea_routes.")]:
+        sys.modules.pop(mod_name, None)
+    (api / "pyproject.toml").write_text(
+        base_pyproject + '\n[tool.haumea]\ninclude = ["pkg-a"]\n'
+    )
+    out_proj = build(
+        api, python=host_python, platform=None, output=tmp_path / "out-proj-inc"
+    )
+    capsys.readouterr()
+    assert json.loads(invoke(out_proj, "computed", "/computed")["body"]) == {
+        "value": "from-pkg-a"
+    }
+
+
+# @lat: [[tests#Import check platform matching]]
+def test_build_import_check_skips_non_matching_platform(
+    tmp_path, isolated_imports, monkeypatch, capsys
+):
+    project = tmp_path / "plat"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "plat"\nversion = "0"\n',
+            "app/route.py": "def GET():\n    return {'ok': True}\n",
+        },
+    )
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+
+    uv_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:3] == ["uv", "python", "find"]:
+            uv_calls.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(build_module.subprocess, "run", spy_run)
+
+    # On macOS arm64, DEFAULT_PLATFORM (x86_64-manylinux_2_28) skips the check.
+    monkeypatch.setattr(build_module, "_host_os_arch", lambda: ("darwin", "aarch64"))
+    out = build(project, output=tmp_path / "out-darwin")
+    assert out.is_dir()
+    skipped_out = capsys.readouterr().out
+    assert "skip" in skipped_out.lower()
+    assert build_module.DEFAULT_PLATFORM in skipped_out
+    assert uv_calls == []
+
+    # On Linux x86_64, a non-matching platform (e.g. aarch64-apple-darwin) also skips.
+    monkeypatch.setattr(build_module, "_host_os_arch", lambda: ("linux", "x86_64"))
+    out_linux_skip = build(
+        project, platform="aarch64-apple-darwin", output=tmp_path / "out-linux-skip"
+    )
+    assert out_linux_skip.is_dir()
+    linux_skip_out = capsys.readouterr().out
+    assert "skip" in linux_skip_out.lower()
+    assert "aarch64-apple-darwin" in linux_skip_out
+    assert uv_calls == []
+
+    # On Linux x86_64, DEFAULT_PLATFORM matches the host so the check runs
+    # (and fails here because `_install_dependencies` was stubbed without haumea).
+    host_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    with pytest.raises(RuntimeError) as exc_info:
+        build(
+            project,
+            python=host_python,
+            platform=build_module.DEFAULT_PLATFORM,
+            output=tmp_path / "out-linux-match",
+        )
+    assert "index" in str(exc_info.value)
+    assert "haumea" in str(exc_info.value)
+    assert uv_calls == [["uv", "python", "find", host_python]]
+
+
+# @lat: [[tests#Import check target interpreter]]
+def test_build_import_check_uses_uv_python_find(
+    tmp_path, isolated_imports, monkeypatch, capsys
+):
+    repo_root = Path(__file__).parent.parent.resolve()
+    host_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    workspace = tmp_path / "interp-ws"
+    write_project(
+        workspace,
+        {
+            "pyproject.toml": '[tool.uv.workspace]\nmembers = ["apps/*"]\n',
+        },
+    )
+    write_project(
+        workspace / "apps" / "api",
+        {
+            "pyproject.toml": (
+                '[project]\nname = "api"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\n'
+                'dependencies = ["haumea"]\n\n'
+                "[tool.uv.sources]\n"
+                f"haumea = {{ path = {json.dumps(repo_root.as_posix())}, "
+                "editable = true }\n"
+            ),
+            "app/route.py": 'def GET():\n    return {"ok": True}\n',
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=workspace, check=True)
+    api = workspace / "apps" / "api"
+
+    # Build a wrapper script at a distinct path so we can prove the import check
+    # invokes the interpreter returned by `uv python find`, not `sys.executable`.
+    marker = tmp_path / "invocations.log"
+    wrapper = tmp_path / "resolved-python"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s %s %s\\n" "$1" "$2" "$3" >> {json.dumps(str(marker))}\n'
+        f'exec {json.dumps(sys.executable)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    real_run = subprocess.run
+    find_calls: list[list[str]] = []
+    find_returncode = 0
+    find_stdout = f"{wrapper}\n"
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:3] == ["uv", "python", "find"]:
+            find_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, find_returncode, find_stdout, "")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(build_module.subprocess, "run", fake_run)
+
+    out = build(api, python=host_python, platform=None, output=tmp_path / "out-ok")
+    assert out.is_dir()
+    capsys.readouterr()
+    assert find_calls == [["uv", "python", "find", host_python]]
+    invoked = marker.read_text().splitlines()
+    assert len(invoked) == 1
+    assert "-I" in invoked[0].split()
+
+    # Passing a different `--python` forwards that version to `uv python find`.
+    find_calls.clear()
+    marker.unlink()
+    real_install = build_module._install_dependencies
+
+    def install_for_host(ws_root, vendor_dir, _py, plat, pkg=None):
+        real_install(ws_root, vendor_dir, host_python, plat, pkg)
+
+    monkeypatch.setattr(build_module, "_install_dependencies", install_for_host)
+    out_other = build(api, python="3.13", platform=None, output=tmp_path / "out-313")
+    assert out_other.is_dir()
+    capsys.readouterr()
+    assert find_calls == [["uv", "python", "find", "3.13"]]
+    assert marker.is_file()
+
+    # When `uv python find` finds no interpreter, skip with a message instead of
+    # falling back to `sys.executable`, even when `--python` matches host_python.
+    find_calls.clear()
+    marker.unlink()
+    find_returncode = 2
+    find_stdout = ""
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    out_missing = build(
+        api, python=host_python, platform=None, output=tmp_path / "out-no-interp"
+    )
+    assert out_missing.is_dir()
+    skip_out = capsys.readouterr().out
+    assert "skip" in skip_out.lower()
+    assert host_python in skip_out
+    assert find_calls == [["uv", "python", "find", host_python]]
+    assert not marker.exists()
