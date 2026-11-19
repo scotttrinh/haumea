@@ -639,6 +639,17 @@ class FunctionReport:
     distributions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class FunctionExplanation:
+    """Explanation of why distributions were included or excluded for one function."""
+
+    name: str
+    included: Mapping[str, str]
+    """Sorted included distribution name -> human-readable reason chain."""
+    excluded: tuple[str, ...]
+    """Sorted distribution names present in the store but not bundled."""
+
+
 def _dir_size(directory: Path) -> int:
     """Return the total uncompressed byte size of files under ``directory``."""
     total = 0
@@ -670,16 +681,52 @@ def _format_largest_distributions(
     )
 
 
-def _report_functions(reports: list[FunctionReport], store: StoreIndex) -> None:
-    """Print per-function sizes, warn above ``SIZE_WARN_BYTES``, and fail above
-    ``SIZE_LIMIT_BYTES``."""
-    if not reports:
+def _print_distribution_section(
+    heading: str,
+    rows: Sequence[tuple[str, str | None]],
+    store: StoreIndex,
+) -> None:
+    count = len(rows)
+    unit = "distribution" if count == 1 else "distributions"
+    print(f"  {heading} ({count} {unit}):")
+    if not rows:
+        print("    (none)")
         return
-    width = max(len(report.name) for report in reports)
-    for report in reports:
-        count = len(report.distributions)
-        unit = "distribution" if count == 1 else "distributions"
-        print(f"  {report.name:<{width}}  {_format_size(report.size)} ({count} {unit})")
+    name_width = max(len(name) for name, _ in rows)
+    sizes = {name: _format_size(store.distributions[name].size) for name, _ in rows}
+    size_width = max(len(size) for size in sizes.values())
+    for name, reason in rows:
+        suffix = f"  {reason}" if reason is not None else ""
+        print(f"    {name:<{name_width}}  {sizes[name]:>{size_width}}{suffix}")
+
+
+def _print_explanation(explanation: FunctionExplanation, store: StoreIndex) -> None:
+    """Print why each distribution was included or excluded for one function."""
+    print(f"\nExplain {explanation.name}:")
+    _print_distribution_section("Included", list(explanation.included.items()), store)
+    _print_distribution_section(
+        "Excluded", [(name, None) for name in explanation.excluded], store
+    )
+
+
+def _report_functions(
+    reports: list[FunctionReport],
+    store: StoreIndex,
+    *,
+    explanation: FunctionExplanation | None = None,
+) -> None:
+    """Print per-function sizes, optional explanation, warn above
+    ``SIZE_WARN_BYTES``, and fail above ``SIZE_LIMIT_BYTES``."""
+    if reports:
+        width = max(len(report.name) for report in reports)
+        for report in reports:
+            count = len(report.distributions)
+            unit = "distribution" if count == 1 else "distributions"
+            size = _format_size(report.size)
+            print(f"  {report.name:<{width}}  {size} ({count} {unit})")
+
+    if explanation is not None:
+        _print_explanation(explanation, store)
 
     oversized: list[str] = []
     for report in reports:
@@ -951,60 +998,155 @@ def _resolve_import_ref(
     return [], store.by_import.get(top, ())
 
 
-def trace_function(
-    spec: FunctionSpec, project_dir: Path, store: StoreIndex
-) -> frozenset[str]:
-    """Statically trace ``spec.trace_roots`` and ``spec.entrypoint``, following
-    project modules recursively and returning matched distribution names."""
-    project_root = project_dir.resolve()
-    visited: set[Path] = set()
-    queue: deque[Path] = deque()
-    distributions: set[str] = set()
+def _relative_display(path: Path, project_root: Path) -> str:
+    """Format ``path`` relative to ``project_root`` in POSIX style when possible."""
+    try:
+        return path.resolve().relative_to(project_root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
-    def enqueue_files(paths: Iterable[Path]) -> None:
+
+def _trace_function_chains(
+    spec: FunctionSpec, project_dir: Path, store: StoreIndex
+) -> dict[str, tuple[str, ...]]:
+    """Statically trace ``spec.trace_roots`` and ``spec.entrypoint``, returning
+    each matched distribution mapped to the shortest file chain that imports it."""
+    project_root = project_dir.resolve()
+    visited: dict[Path, tuple[str, ...]] = {}
+    queue: deque[Path] = deque()
+    chains: dict[str, tuple[str, ...]] = {}
+
+    def enqueue_files(paths: Iterable[Path], parent_chain: tuple[str, ...]) -> None:
         for path in paths:
             resolved = path.resolve()
             if resolved not in visited and resolved.is_file():
-                visited.add(resolved)
+                visited[resolved] = (
+                    *parent_chain,
+                    _relative_display(resolved, project_root),
+                )
                 queue.append(resolved)
 
-    def process_refs(refs: list[_ImportRef], current_package: tuple[str, ...]) -> None:
+    def process_refs(
+        refs: list[_ImportRef],
+        current_package: tuple[str, ...],
+        current_chain: tuple[str, ...],
+    ) -> None:
         for ref in refs:
             files, dists = _resolve_import_ref(
                 ref, current_package, project_root, store
             )
-            enqueue_files(files)
-            distributions.update(dists)
+            enqueue_files(files, current_chain)
+            for dist in dists:
+                chains.setdefault(dist, current_chain)
 
-    # Trace generated entrypoint (imports haumea) plus every file trace root.
-    process_refs(_extract_imports(spec.entrypoint, str(project_root / ENTRYPOINT)), ())
-    enqueue_files(spec.trace_roots)
+    def drain_queue() -> None:
+        while queue:
+            current = queue.popleft()
+            package = _package_parts(current, project_root)
+            process_refs(
+                _extract_imports(current.read_bytes(), str(current)),
+                package,
+                visited[current],
+            )
 
-    while queue:
-        current = queue.popleft()
-        package = _package_parts(current, project_root)
-        process_refs(_extract_imports(current.read_bytes(), str(current)), package)
+    enqueue_files(spec.trace_roots, ())
+    drain_queue()
 
-    return frozenset(distributions)
+    # Trace generated entrypoint (imports haumea) after file trace roots.
+    process_refs(
+        _extract_imports(spec.entrypoint, str(project_root / ENTRYPOINT)),
+        (),
+        (ENTRYPOINT,),
+    )
+    drain_queue()
+
+    return chains
 
 
-def resolve_closure(seeds: Iterable[str], store: StoreIndex) -> tuple[str, ...]:
-    """Return the sorted transitive closure of ``seeds`` over ``Requires-Dist``
-    for distributions present in ``store``."""
-    included: set[str] = set()
+def _format_closure_reason(
+    name: str,
+    seed_reasons: Mapping[str, str],
+    parents: Mapping[str, str],
+) -> str:
+    if name in seed_reasons:
+        return seed_reasons[name]
+    chain: list[str] = []
+    current = name
+    while current in parents:
+        parent = parents[current]
+        chain.append(parent)
+        current = parent
+    return f"required by {' <- '.join(chain)} <- {seed_reasons[current]}"
+
+
+def _resolve_closure_with_reasons(
+    seeds: Iterable[tuple[str, str]], store: StoreIndex
+) -> dict[str, str]:
+    """Return sorted ``distribution -> reason`` for the transitive closure of
+    ``seeds`` over ``Requires-Dist`` for distributions present in ``store``."""
+    seed_reasons: dict[str, str] = {}
+    parents: dict[str, str] = {}
     queue: deque[str] = deque()
-    for raw in seeds:
+    for raw, reason in seeds:
         name = normalize_dist_name(raw)
-        if name in store.distributions and name not in included:
-            included.add(name)
+        if name in store.distributions and name not in seed_reasons:
+            seed_reasons[name] = reason
             queue.append(name)
+    visited = set(seed_reasons)
     while queue:
         current = queue.popleft()
-        for req in store.distributions[current].requires:
-            if req in store.distributions and req not in included:
-                included.add(req)
+        for req in sorted(store.distributions[current].requires):
+            if req in store.distributions and req not in visited:
+                visited.add(req)
+                parents[req] = current
                 queue.append(req)
-    return tuple(sorted(included))
+    return {
+        name: _format_closure_reason(name, seed_reasons, parents)
+        for name in sorted(visited)
+    }
+
+
+def _resolve_shaken_reasons(
+    spec: FunctionSpec,
+    project_dir: Path,
+    config: HaumeaConfig,
+    store: StoreIndex,
+) -> dict[str, str]:
+    """Compute sorted ``distribution -> reason`` for a tree-shaken function."""
+    project_root = project_dir.resolve()
+    traced = _trace_function_chains(spec, project_root, store)
+    route_label = _relative_display(spec.route.file, project_root)
+
+    seeds: list[tuple[str, str]] = [
+        (name, "always included") for name in ALWAYS_INCLUDED
+    ]
+    seeds.extend(
+        (name, f"traced from {' -> '.join(chain)}") for name, chain in traced.items()
+    )
+    seeds.extend(
+        (name, f"listed in route include ({route_label})") for name in spec.include
+    )
+    seeds.extend((name, "listed in [tool.haumea] include") for name in config.include)
+    return _resolve_closure_with_reasons(seeds, store)
+
+
+def explain_function(
+    spec: FunctionSpec,
+    project_dir: Path,
+    config: HaumeaConfig,
+    store: StoreIndex,
+) -> FunctionExplanation:
+    """Compute included distributions with reason chains and excluded
+    distributions for ``spec``."""
+    if not config.tree_shake:
+        included = {
+            name: "tree_shake = false (full store)" for name in store.distributions
+        }
+        return FunctionExplanation(name=spec.name, included=included, excluded=())
+
+    included = _resolve_shaken_reasons(spec, project_dir, config, store)
+    excluded = tuple(name for name in store.distributions if name not in included)
+    return FunctionExplanation(name=spec.name, included=included, excluded=excluded)
 
 
 def resolve_distributions(
@@ -1014,13 +1156,7 @@ def resolve_distributions(
     store: StoreIndex,
 ) -> tuple[str, ...]:
     """Compute the final sorted distributions to bundle for ``spec``."""
-    seeds = (
-        *trace_function(spec, project_dir, store),
-        *ALWAYS_INCLUDED,
-        *config.include,
-        *spec.include,
-    )
-    return resolve_closure(seeds, store)
+    return tuple(_resolve_shaken_reasons(spec, project_dir, config, store))
 
 
 def _link_distributions(
@@ -1279,8 +1415,25 @@ def _check_function_imports(
         _check_one_function(spec, func_dir, interpreter)
 
 
-def emit_build(plan: BuildPlan) -> Path:
+def _resolve_explain_target(plan: BuildPlan, explain: str) -> str:
+    """Match ``explain`` (with optional ``.func`` suffix) to a planned function."""
+    names = tuple(spec.name for spec in plan.functions)
+    if explain in names:
+        return explain
+    normalized = explain.strip().removesuffix(".func")
+    if normalized in names:
+        return normalized
+    available = ", ".join(names) if names else "(none)"
+    raise ValueError(
+        f"unknown function {explain!r} for --explain; available functions: {available}"
+    )
+
+
+def emit_build(plan: BuildPlan, *, explain: str | None = None) -> Path:
     """Write ``plan`` to its output directory and return that path."""
+    explain_target = (
+        _resolve_explain_target(plan, explain) if explain is not None else None
+    )
     output = plan.output_dir.resolve()
     _validate_output_dir(output, plan.project_dir, plan.app_dir, plan.public_dir)
     if output.exists():
@@ -1292,6 +1445,7 @@ def emit_build(plan: BuildPlan) -> Path:
     # inside output so os.link stays on the same filesystem and copytree
     # excludes both output and staging together.
     func_dirs: list[tuple[FunctionSpec, Path]] = []
+    explanation: FunctionExplanation | None = None
     with tempfile.TemporaryDirectory(dir=output, prefix=".haumea-") as tmp:
         shared = Path(tmp) / "shared"
         shutil.copytree(plan.project_dir, shared, ignore=_ignore_path(output, IGNORE))
@@ -1324,6 +1478,10 @@ def emit_build(plan: BuildPlan) -> Path:
                         copy_function=os.link,
                         dirs_exist_ok=True,
                     )
+            if spec.name == explain_target:
+                explanation = explain_function(
+                    spec, plan.project_dir, plan.config, store
+                )
             func_dirs.append((spec, func_dir))
             reports.append(
                 FunctionReport(
@@ -1333,7 +1491,7 @@ def emit_build(plan: BuildPlan) -> Path:
                 )
             )
 
-    _report_functions(reports, store)
+    _report_functions(reports, store, explanation=explanation)
     _check_function_imports(plan, func_dirs)
 
     _write_static(plan, output / "static")
@@ -1349,6 +1507,7 @@ def build(
     python: str = DEFAULT_PYTHON,
     platform: str | None = DEFAULT_PLATFORM,
     output: str | Path | None = None,
+    explain: str | None = None,
 ) -> Path:
     """Build ``project_dir`` into ``output`` (default ``.vercel/output``) and
     return that path.
@@ -1357,5 +1516,6 @@ def build(
     which makes the output runnable locally (used by the tests).
     """
     return emit_build(
-        plan_build(project_dir, python=python, platform=platform, output=output)
+        plan_build(project_dir, python=python, platform=platform, output=output),
+        explain=explain,
     )

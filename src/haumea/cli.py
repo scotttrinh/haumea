@@ -37,6 +37,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="output directory (default: .vercel/output)",
     )
+    build_cmd.add_argument(
+        "--explain",
+        default=None,
+        metavar="FUNCTION",
+        help="explain why each distribution was included or excluded for a function",
+    )
 
     args = parser.parse_args(argv)
 
@@ -65,7 +71,13 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "build":
         platform = None if args.platform == "native" else args.platform
-        output = build(".", python=args.python, platform=platform, output=args.output)
+        output = build(
+            ".",
+            python=args.python,
+            platform=platform,
+            output=args.output,
+            explain=args.explain,
+        )
         print(f"Build output written to {os.path.relpath(output)}")
         print("Deploy with: vercel deploy --prebuilt")
 

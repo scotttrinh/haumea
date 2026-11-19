@@ -146,7 +146,7 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 
 ## Import tracer and closure
 
-Verify [[src/haumea/build.py#trace_function]], [[src/haumea/build.py#resolve_closure]], [[src/haumea/build.py#ALWAYS_INCLUDED]], and [[src/haumea/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
+Verify [[src/haumea/build.py#_trace_function_chains]], [[src/haumea/build.py#_resolve_closure_with_reasons]], [[src/haumea/build.py#ALWAYS_INCLUDED]], and [[src/haumea/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
 Covers `vercel-functions` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
@@ -163,3 +163,9 @@ Verify [[src/haumea/build.py#_check_function_imports]] skips with a printed mess
 ## Import check target interpreter
 
 Verify [[src/haumea/build.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.
+
+## Build explain
+
+Verify `haumea build --explain <function>` (via [[src/haumea/cli.py#main]] and [[src/haumea/build.py#build]]) prints reason chains for included distributions and lists excluded ones.
+
+Covers direct and helper-file traced imports, multi-hop transitive `Requires-Dist` chains, always-included packages and their dependencies, route and project `include`, excluded distributions omitted from `_vendor/`, `.func` suffix normalization, `tree_shake = false`, and `ValueError` on unknown function names without modifying an existing output directory.

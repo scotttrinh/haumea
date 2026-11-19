@@ -2178,3 +2178,216 @@ def test_build_import_check_uses_uv_python_find(
     assert host_python in skip_out
     assert find_calls == [["uv", "python", "find", host_python]]
     assert not marker.exists()
+
+
+# @lat: [[tests#Build explain]]
+def test_build_explain(tmp_path, isolated_imports, monkeypatch, capsys):
+    repo_root = Path(__file__).parent.parent.resolve()
+    workspace = tmp_path / "explain-ws"
+    write_project(
+        workspace,
+        {
+            "pyproject.toml": (
+                '[tool.uv.workspace]\nmembers = ["apps/*", "packages/*"]\n'
+            ),
+        },
+    )
+    _write_workspace_pkg(workspace, "pkg-leaf", "pkg_leaf", 'VAL = "leaf"\n')
+    _write_workspace_pkg(
+        workspace,
+        "pkg-mid",
+        "pkg_mid",
+        'import pkg_leaf\nVAL = f"mid+{pkg_leaf.VAL}"\n',
+        deps=["pkg-leaf"],
+    )
+    _write_workspace_pkg(
+        workspace,
+        "pkg-a",
+        "pkg_a",
+        'import pkg_mid\ndef run() -> str:\n    return f"a+{pkg_mid.VAL}"\n',
+        deps=["pkg-mid"],
+    )
+    _write_workspace_pkg(workspace, "pkg-direct", "pkg_direct", 'NAME = "direct"\n')
+    _write_workspace_pkg(
+        workspace, "pkg-route-inc", "pkg_route_inc", 'NAME = "route-inc"\n'
+    )
+    _write_workspace_pkg(
+        workspace, "pkg-proj-inc", "pkg_proj_inc", 'NAME = "proj-inc"\n'
+    )
+    _write_workspace_pkg(workspace, "pkg-only-beta", "pkg_only_beta", 'NAME = "beta"\n')
+
+    base_pyproject = (
+        '[project]\nname = "api"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.12"\n'
+        "dependencies = [\n"
+        '    "haumea",\n'
+        '    "pkg-a",\n'
+        '    "pkg-direct",\n'
+        '    "pkg-route-inc",\n'
+        '    "pkg-proj-inc",\n'
+        '    "pkg-only-beta",\n'
+        "]\n\n"
+        "[tool.uv.sources]\n"
+        f"haumea = {{ path = {json.dumps(repo_root.as_posix())}, editable = true }}\n"
+        "pkg-a = { workspace = true }\n"
+        "pkg-direct = { workspace = true }\n"
+        "pkg-route-inc = { workspace = true }\n"
+        "pkg-proj-inc = { workspace = true }\n"
+        "pkg-only-beta = { workspace = true }\n"
+    )
+    api = workspace / "apps" / "api"
+    write_project(
+        api,
+        {
+            "pyproject.toml": (
+                base_pyproject + '\n[tool.haumea]\ninclude = ["pkg_proj_inc"]\n'
+            ),
+            "helpers/__init__.py": "",
+            "helpers/a.py": (
+                "import pkg_a\n\ndef run() -> str:\n    return pkg_a.run()\n"
+            ),
+            "app/alpha/route.py": (
+                "import pkg_direct\n"
+                "from helpers.a import run\n\n"
+                'include = ["Pkg_Route_Inc"]\n\n'
+                "def GET():\n"
+                '    return {"direct": pkg_direct.NAME, "a": run()}\n'
+            ),
+            "app/beta/route.py": (
+                "import pkg_only_beta\n\n"
+                "def GET():\n"
+                '    return {"beta": pkg_only_beta.NAME}\n'
+            ),
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=workspace, check=True)
+
+    for dist_name in (
+        "pkg-leaf",
+        "pkg-mid",
+        "pkg-a",
+        "pkg-direct",
+        "pkg-route-inc",
+        "pkg-proj-inc",
+        "pkg-only-beta",
+    ):
+        monkeypatch.syspath_prepend(str(workspace / "packages" / dist_name / "src"))
+
+    def parse_explain_sections(output: str) -> tuple[dict[str, str], list[str]]:
+        included: dict[str, str] = {}
+        excluded: list[str] = []
+        section: str | None = None
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Included ("):
+                section = "included"
+                continue
+            if stripped.startswith("Excluded ("):
+                section = "excluded"
+                continue
+            if section == "included":
+                if not line.startswith("    "):
+                    section = None
+                    continue
+                if stripped == "(none)":
+                    continue
+                name, rest = stripped.split(None, 1)
+                included[name] = rest
+            elif section == "excluded":
+                if not line.startswith("    "):
+                    section = None
+                    continue
+                if stripped == "(none)":
+                    continue
+                excluded.append(stripped.split()[0])
+        return included, excluded
+
+    monkeypatch.chdir(api)
+    out_alpha = tmp_path / "out-alpha"
+    cli_main(
+        [
+            "build",
+            "--platform",
+            "native",
+            "--output",
+            str(out_alpha),
+            "--explain",
+            "alpha",
+        ]
+    )
+    alpha_stdout = capsys.readouterr().out
+    assert "Explain alpha:" in alpha_stdout
+    inc, exc = parse_explain_sections(alpha_stdout)
+
+    assert "always included" in inc["haumea"]
+    assert "always included" in inc["vercel-runtime"]
+    assert "required by haumea <- always included" in inc["msgspec"]
+    assert "traced from app/alpha/route.py" in inc["pkg-direct"]
+    assert "traced from app/alpha/route.py -> helpers/a.py" in inc["pkg-a"]
+    assert (
+        "required by pkg-a <- traced from app/alpha/route.py -> helpers/a.py"
+        in inc["pkg-mid"]
+    )
+    assert (
+        "required by pkg-mid <- pkg-a <- traced from app/alpha/route.py -> helpers/a.py"
+        in inc["pkg-leaf"]
+    )
+    assert "listed in route include (app/alpha/route.py)" in inc["pkg-route-inc"]
+    assert "listed in [tool.haumea] include" in inc["pkg-proj-inc"]
+
+    assert "pkg-only-beta" in exc
+    assert "pkg-only-beta" not in inc
+    assert exc == sorted(exc)
+    alpha_vendor = out_alpha / "functions" / "alpha.func" / "_vendor"
+    assert not (alpha_vendor / "pkg_only_beta").exists()
+    assert "pkg-only-beta" not in build_module.index_store(alpha_vendor).distributions
+
+    # Trailing `.func` suffix is normalized to match the function name.
+    out_beta = tmp_path / "out-beta"
+    build(api, platform=None, output=out_beta, explain="beta.func")
+    beta_stdout = capsys.readouterr().out
+    assert "Explain beta:" in beta_stdout
+    beta_inc, beta_exc = parse_explain_sections(beta_stdout)
+    assert "traced from app/beta/route.py" in beta_inc["pkg-only-beta"]
+    assert "listed in [tool.haumea] include" in beta_inc["pkg-proj-inc"]
+    for excluded_name in (
+        "pkg-a",
+        "pkg-mid",
+        "pkg-leaf",
+        "pkg-direct",
+        "pkg-route-inc",
+    ):
+        assert excluded_name in beta_exc
+        assert excluded_name not in beta_inc
+
+    # `tree_shake = false` explains every store distribution with none excluded.
+    (api / "pyproject.toml").write_text(
+        base_pyproject + "\n[tool.haumea]\ntree_shake = false\n"
+    )
+    out_full = tmp_path / "out-full"
+    build(api, platform=None, output=out_full, explain="alpha")
+    full_stdout = capsys.readouterr().out
+    assert "Explain alpha:" in full_stdout
+    full_inc, full_exc = parse_explain_sections(full_stdout)
+    assert full_exc == []
+    assert "(none)" in full_stdout
+    for dist_name in (
+        "haumea",
+        "pkg-a",
+        "pkg-mid",
+        "pkg-leaf",
+        "pkg-only-beta",
+    ):
+        assert "tree_shake = false" in full_inc[dist_name]
+
+    # Unknown `--explain` function raises ValueError naming it and available functions,
+    # before touching an existing output directory.
+    sentinel = out_alpha / "keep.txt"
+    sentinel.write_text("untouched")
+    with pytest.raises(ValueError) as exc_info:
+        cli_main(["build", "--output", str(out_alpha), "--explain", "missing"])
+    msg = str(exc_info.value)
+    assert "missing" in msg
+    assert "alpha" in msg
+    assert "beta" in msg
+    assert sentinel.read_text() == "untouched"
