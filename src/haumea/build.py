@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -112,6 +113,7 @@ def _install_dependencies(
             [
                 "uv",
                 "export",
+                "--locked",
                 "--no-dev",
                 "--no-emit-project",
                 "--no-editable",
@@ -195,6 +197,31 @@ def _clone_config(value: object) -> object:
     return value
 
 
+def _sort_keys(value: object) -> object:
+    """Recursively sort dict keys, keeping mixed key types like ``1`` and ``"1"``
+    distinct."""
+    if isinstance(value, dict):
+        items = [(key, _sort_keys(item)) for key, item in value.items()]
+        try:
+            items.sort(key=lambda pair: pair[0])
+        except TypeError:
+            items.sort(key=lambda pair: (str(pair[0]), type(pair[0]).__qualname__))
+        return dict(items)
+    if isinstance(value, list):
+        return [_sort_keys(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sort_keys(item) for item in value)
+    return value
+
+
+def _dump_json(value: object, *, indent: int | None = None) -> str:
+    """Serialize ``value`` with deterministic key ordering."""
+    try:
+        return json.dumps(value, indent=indent, sort_keys=True)
+    except TypeError:
+        return json.dumps(_sort_keys(value), indent=indent)
+
+
 def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
     module = route.load()
     config: dict[str, object] = {
@@ -229,7 +256,7 @@ def _plan_static(
     prefix = _static_prefix(base_path)
     openapi_url = f"{base_path}/openapi.json"
     return (
-        StaticFile(f"{prefix}openapi.json", json.dumps(app.openapi())),
+        StaticFile(f"{prefix}openapi.json", _dump_json(app.openapi())),
         StaticFile(f"{prefix}docs.html", swagger_html(app.title, openapi_url)),
     )
 
@@ -247,11 +274,44 @@ def _plan_routes(routes: list[Route], base_path: str) -> tuple[dict[str, str], .
     return ({"handle": "filesystem"}, *rewrites)
 
 
+def _validate_output_dir(
+    output_dir: Path, project_dir: Path, app_dir: Path, public_dir: Path | None
+) -> None:
+    resolved_output = output_dir.resolve()
+    if project_dir.resolve().is_relative_to(resolved_output):
+        raise ValueError(
+            f"output directory cannot contain {project_dir}: {resolved_output}"
+        )
+    for protected in (app_dir, project_dir / "public", public_dir):
+        if protected is None:
+            continue
+        resolved_protected = protected.resolve()
+        if resolved_protected.is_relative_to(
+            resolved_output
+        ) or resolved_output.is_relative_to(resolved_protected):
+            raise ValueError(
+                f"output directory cannot overlap {protected}: {resolved_output}"
+            )
+
+
+def _ignore_path(
+    target: Path, base: Callable[[str, list[str]], set[str]] | None = None
+) -> Callable[[str, list[str]], set[str]]:
+    def ignore(src: str, names: list[str]) -> set[str]:
+        ignored = set(base(src, names)) if base else set()
+        if Path(src).resolve() == target.parent and target.name in names:
+            ignored.add(target.name)
+        return ignored
+
+    return ignore
+
+
 def plan_build(
     project_dir: str | Path = ".",
     *,
     python: str = DEFAULT_PYTHON,
     platform: str | None = DEFAULT_PLATFORM,
+    output: str | Path | None = None,
 ) -> BuildPlan:
     """Discover ``project_dir``'s routes and plan its build, leaving the output
     directory untouched.
@@ -272,6 +332,10 @@ def plan_build(
     public: Path | None = project_dir / "public"
     if not public.is_dir():
         public = None
+    output_dir = (
+        Path(output).resolve() if output is not None else project_dir / OUTPUT_DIR
+    )
+    _validate_output_dir(output_dir, project_dir, app_dir, public)
     routes = discover_routes(app_dir, base_path)
 
     # Plan.
@@ -280,7 +344,7 @@ def plan_build(
         workspace_root=project_dir,
         app_dir=app_dir,
         public_dir=public,
-        output_dir=project_dir / OUTPUT_DIR,
+        output_dir=output_dir,
         config=config,
         python=python,
         platform=platform,
@@ -295,7 +359,7 @@ def _write_function(spec: FunctionSpec, shared: Path, functions_dir: Path) -> No
     func_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(shared, func_dir, copy_function=os.link)
     (func_dir / ENTRYPOINT).write_text(spec.entrypoint)
-    (func_dir / ".vc-config.json").write_text(json.dumps(spec.vc_config, indent=2))
+    (func_dir / ".vc-config.json").write_text(_dump_json(spec.vc_config, indent=2))
 
 
 def _write_static(plan: BuildPlan, static_dir: Path) -> None:
@@ -304,7 +368,11 @@ def _write_static(plan: BuildPlan, static_dir: Path) -> None:
     public_dir = plan.public_dir or (plan.project_dir / "public")
     public_dest = static_dir / _static_prefix(plan.config.base_path)
     if public_dir.is_dir():
-        shutil.copytree(public_dir, public_dest)
+        shutil.copytree(
+            public_dir,
+            public_dest,
+            ignore=_ignore_path(plan.output_dir.resolve()),
+        )
     else:
         public_dest.mkdir(parents=True)
     for file in plan.static_files:
@@ -315,15 +383,18 @@ def _write_static(plan: BuildPlan, static_dir: Path) -> None:
 
 def emit_build(plan: BuildPlan) -> Path:
     """Write ``plan`` to its output directory and return that path."""
-    output = plan.output_dir
+    output = plan.output_dir.resolve()
+    _validate_output_dir(output, plan.project_dir, plan.app_dir, plan.public_dir)
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
     # Assemble what every function shares once, then hard-link it into each.
-    with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
+    # Keep the staging directory inside output so os.link stays on the same
+    # filesystem and copytree excludes both output and staging together.
+    with tempfile.TemporaryDirectory(dir=output, prefix=".haumea-") as tmp:
         shared = Path(tmp) / "shared"
-        shutil.copytree(plan.project_dir, shared, ignore=IGNORE)
+        shutil.copytree(plan.project_dir, shared, ignore=_ignore_path(output, IGNORE))
         (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
         _install_dependencies(
             plan.project_dir, shared / VENDOR_DIR, plan.python, plan.platform
@@ -333,7 +404,7 @@ def emit_build(plan: BuildPlan) -> Path:
 
     _write_static(plan, output / "static")
     (output / "config.json").write_text(
-        json.dumps({"version": 3, "routes": list(plan.routes)}, indent=2)
+        _dump_json({"version": 3, "routes": list(plan.routes)}, indent=2)
     )
     return output
 
@@ -343,10 +414,14 @@ def build(
     *,
     python: str = DEFAULT_PYTHON,
     platform: str | None = DEFAULT_PLATFORM,
+    output: str | Path | None = None,
 ) -> Path:
-    """Build ``project_dir`` into ``.vercel/output`` and return that path.
+    """Build ``project_dir`` into ``output`` (default ``.vercel/output``) and
+    return that path.
 
     Pass ``platform=None`` to vendor dependencies for the current machine,
     which makes the output runnable locally (used by the tests).
     """
-    return emit_build(plan_build(project_dir, python=python, platform=platform))
+    return emit_build(
+        plan_build(project_dir, python=python, platform=platform, output=output)
+    )

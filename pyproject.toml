@@ -35,6 +35,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.uv]
+exclude-newer = "2 days"
 # Rebuild when sources change, so apps depending on a local checkout by path
 # (like examples/hello) don't vendor a stale cached wheel.
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]

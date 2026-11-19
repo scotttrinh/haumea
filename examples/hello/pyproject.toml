@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = ["haumea"]
 
 [tool.uv]
+exclude-newer = "2 days"
 package = false
 
 [tool.uv.sources]

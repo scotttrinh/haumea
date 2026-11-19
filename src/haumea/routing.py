@@ -117,7 +117,7 @@ def discover_routes(app_dir: str | Path, base_path: str = "") -> list[Route]:
         sys.path.insert(0, project_root)
 
     routes = [_route(app_dir, file, base_path) for file in app_dir.rglob(ROUTE_FILE)]
-    return sorted(routes, key=lambda route: (route.rank, route.url_path))
+    return sorted(routes, key=lambda route: (route.rank, route.url_path, route.file))
 
 
 def _add_route(app: Haumea, route: Route) -> None:

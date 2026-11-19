@@ -32,6 +32,11 @@ def main(argv: list[str] | None = None) -> None:
         help="uv --python-platform for vendored dependencies; "
         "'native' targets this machine",
     )
+    build_cmd.add_argument(
+        "--output",
+        default=None,
+        help="output directory (default: .vercel/output)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -53,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "build":
         platform = None if args.platform == "native" else args.platform
-        output = build(".", python=args.python, platform=platform)
+        output = build(".", python=args.python, platform=platform, output=args.output)
         print(f"Build output written to {os.path.relpath(output)}")
         print("Deploy with: vercel deploy --prebuilt")
 

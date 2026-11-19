@@ -93,3 +93,17 @@ Dependencies are vendored from `examples/hello`'s lock, since the temporary proj
 ## Prefixed build without public
 
 Verify a prefixed build with no `public/` writes only `static/api/` docs, and that a `public/` created while route modules import is still copied under `static/api/`.
+
+## Custom build output directory
+
+Verify [[src/haumea/build.py#plan_build]], [[src/haumea/build.py#build]], and [[src/haumea/cli.py#main]] (`--output`) write to a custom directory without creating `.vercel/output`.
+
+Checks output paths both outside and inside `project_dir` (ensuring neither the output directory nor `.haumea-*` staging dirs leak into `.func` payloads across repeated builds) and `ValueError` rejection for paths containing the project or overlapping `app/` or `public/`.
+
+## Locked lockfile
+
+Verify [[src/haumea/build.py#build]] fails with `RuntimeError` when `uv.lock` is stale relative to `pyproject.toml` or missing, without modifying `uv.lock`.
+
+## Deterministic build output
+
+Verify repeated builds of the same project into separate directories produce byte-for-byte identical trees and that `config.json`, `openapi.json`, and `.vc-config.json` serialize with sorted keys.

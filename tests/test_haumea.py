@@ -16,6 +16,7 @@ from haumea import (
 )
 from haumea import build as build_module
 from haumea.build import build, emit_build, plan_build
+from haumea.cli import main as cli_main
 from haumea.config import normalize_base_path
 from haumea.openapi import swagger_html
 from haumea.routing import discover_routes
@@ -833,3 +834,149 @@ def test_prefixed_build_without_public(tmp_path, isolated_imports, monkeypatch):
     static = emit_build(plan) / "static"
     assert (static / "api" / "late.txt").read_text() == "created"
     assert (static / "api" / "docs.html").is_file()
+
+
+# @lat: [[tests#Custom build output directory]]
+def test_custom_build_output_directory(tmp_path, isolated_imports, monkeypatch, capsys):
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    project = tmp_path / "custom"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "custom"\nversion = "0"\n',
+            "app/route.py": "def GET():\n    return {'ok': True}\n",
+            "public/hello.txt": "hi\n",
+        },
+    )
+
+    # plan_build accepts a custom output path without creating it.
+    external = tmp_path / "artifacts" / "out"
+    plan = plan_build(project, output=external)
+    assert plan.output_dir == external.resolve()
+    assert not external.exists()
+
+    # build() writes to the custom directory and leaves .vercel/output untouched.
+    result = build(project, output=external)
+    assert result == external.resolve()
+    assert (external / "config.json").is_file()
+    assert (external / "static" / "hello.txt").read_text() == "hi\n"
+    assert (external / "functions" / "index.func" / "index.py").is_file()
+    assert not (project / ".vercel").exists()
+
+    # Output inside project_dir does not copy itself or temporary directories
+    # into function payloads, even across repeated builds.
+    nested = project / "dist" / "vercel-output"
+    for _ in range(2):
+        built = build(project, output=nested)
+        assert built == nested.resolve()
+        func = nested / "functions" / "index.func"
+        assert (func / "app" / "route.py").is_file()
+        assert not (func / "dist" / "vercel-output").exists()
+        assert not list(func.rglob(".haumea-*"))
+
+    direct = project / "out"
+    built = build(project, output=direct)
+    assert built == direct.resolve()
+    assert not (direct / "functions" / "index.func" / "out").exists()
+
+    # CLI `--output` builds into the requested directory (relative to cwd).
+    monkeypatch.chdir(project)
+    cli_main(["build", "--output", "cli-out", "--platform", "native"])
+    cli_out = project / "cli-out"
+    assert (cli_out / "config.json").is_file()
+    assert (cli_out / "functions" / "index.func" / "index.py").is_file()
+    assert not (cli_out / "functions" / "index.func" / "cli-out").exists()
+    assert "cli-out" in capsys.readouterr().out
+    assert not (project / ".vercel").exists()
+
+    # Output directories overlapping project source trees are rejected before deletion.
+    for bad in [
+        project,
+        project.parent,
+        project / "app",
+        project / "app" / "out",
+        project / "public",
+        project / "public" / "out",
+    ]:
+        with pytest.raises(ValueError, match="output directory"):
+            plan_build(project, output=bad)
+        assert (project / "app" / "route.py").is_file()
+        assert (project / "public" / "hello.txt").is_file()
+
+
+# @lat: [[tests#Locked lockfile]]
+def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
+    project = tmp_path / "stale"
+    pyproject = (
+        '[project]\nname = "stale"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.12"\ndependencies = []\n'
+    )
+    write_project(
+        project,
+        {
+            "pyproject.toml": pyproject,
+            "app/route.py": "def GET():\n    return {'ok': True}\n",
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=project, check=True)
+    lock_before = (project / "uv.lock").read_text()
+
+    # Drift pyproject.toml from uv.lock without re-locking.
+    (project / "pyproject.toml").write_text(
+        pyproject.replace("dependencies = []", 'dependencies = ["msgspec"]')
+    )
+    with pytest.raises(RuntimeError, match="uv.lock"):
+        build(project, platform=None, output=tmp_path / "out")
+    assert (project / "uv.lock").read_text() == lock_before
+
+    # Missing uv.lock also fails instead of resolving on the fly.
+    (project / "uv.lock").unlink()
+    with pytest.raises(RuntimeError, match="uv.lock"):
+        build(project, platform=None, output=tmp_path / "out2")
+
+
+# @lat: [[tests#Deterministic build output]]
+def test_deterministic_build_output(tmp_path, isolated_imports, monkeypatch):
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    project = tmp_path / "det"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "det"\nversion = "0"\n',
+            "app/z/route.py": "def GET():\n    return {'z': 1}\n",
+            "app/a/route.py": "def GET():\n    return {'a': 1}\n",
+            "app/items/[id]/route.py": (
+                "import msgspec\n\n"
+                "max_duration = 10\n"
+                "memory = 512\n"
+                "regions = ['iad1']\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    name: str\n\n"
+                "def PUT(id: int, item: Item) -> Item:\n"
+                "    return item\n"
+            ),
+            "public/hello.txt": "hello\n",
+        },
+    )
+
+    out1 = build(project, output=tmp_path / "out1")
+    out2 = build(project, output=tmp_path / "out2")
+
+    def snapshot(root: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    assert snapshot(out1) == snapshot(out2)
+
+    config_text = (out1 / "config.json").read_text()
+    assert config_text == json.dumps(json.loads(config_text), indent=2, sort_keys=True)
+
+    openapi_text = (out1 / "static" / "openapi.json").read_text()
+    assert openapi_text == json.dumps(json.loads(openapi_text), sort_keys=True)
+
+    for vc_config in sorted((out1 / "functions").rglob(".vc-config.json")):
+        text = vc_config.read_text()
+        assert text == json.dumps(json.loads(text), indent=2, sort_keys=True)
