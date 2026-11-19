@@ -22,6 +22,7 @@ from haumea.openapi import swagger_html
 from haumea.routing import discover_routes
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
+FULLSTACK = Path(__file__).parent.parent / "examples" / "fullstack"
 AUTH = {"Authorization": "Bearer secret"}
 
 
@@ -1180,3 +1181,66 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
     response = invoke(output, "index", "/?name=haumea")
     assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"greeting": "hello haumea from core"}
+
+
+# @lat: [[tests#Full-stack example build]]
+def test_fullstack_example_build(tmp_path, isolated_imports):
+    backend = FULLSTACK / "backend"
+    vercel = json.loads((FULLSTACK / "vercel.json").read_text())
+    assert vercel["services"]["web"] == {"root": "frontend/", "framework": "nextjs"}
+    assert vercel["services"]["api"] == {
+        "root": "backend/",
+        "framework": "vite",
+        "buildCommand": "uv run --frozen haumea build",
+        "devCommand": "uv run --frozen haumea dev --port $PORT",
+    }
+    assert vercel["rewrites"] == [
+        {"source": "/api/:path*", "destination": {"service": "api"}},
+        {"source": "/(.*)", "destination": {"service": "web"}},
+    ]
+    assert (FULLSTACK / ".python-version").read_text().strip() == "3.12"
+    assert (backend / ".python-version").read_text().strip() == "3.12"
+
+    out = tmp_path / "output"
+    plan = plan_build(backend, platform=None, output=out)
+    assert plan.project_dir == backend.resolve()
+    assert plan.workspace_root == FULLSTACK.resolve()
+    assert plan.package == "fullstack-api"
+    assert plan.config.base_path == "/api"
+
+    output = build(backend, platform=None, output=out)
+    assert output == out.resolve()
+
+    config = json.loads((output / "config.json").read_text())
+    assert config["routes"] == [
+        {"handle": "filesystem"},
+        {"src": "^/api/docs$", "dest": "/api/docs.html"},
+        {"src": "^/api/items/([^/]+)$", "dest": "/api/items/[item_id]"},
+    ]
+
+    docs_html = output / "static" / "api" / "docs.html"
+    assert docs_html.is_file()
+    assert '"/api/openapi.json"' in docs_html.read_text()
+    schema = json.loads((output / "static" / "api" / "openapi.json").read_text())
+    assert set(schema["paths"]) == {"/api", "/api/hello", "/api/items/{item_id}"}
+    assert (output / "static" / "api" / "hello.txt").read_text().strip() == (
+        "A static file served from /api/hello.txt"
+    )
+
+    for func in ("api", "api/hello", "api/items/[item_id]"):
+        assert (output / "functions" / f"{func}.func" / ".vc-config.json").is_file()
+
+    root_res = invoke(output, "api", "/api")
+    assert root_res["statusCode"] == 200
+    assert json.loads(root_res["body"]) == {
+        "service": "haumea",
+        "message": "Hello from Haumea",
+    }
+
+    hello_res = invoke(output, "api/hello", "/api/hello?name=vercel")
+    assert hello_res["statusCode"] == 200
+    assert json.loads(hello_res["body"]) == {"hello": "vercel"}
+
+    item_res = invoke(output, "api/items/[item_id]", "/api/items/42")
+    assert item_res["statusCode"] == 200
+    assert json.loads(item_res["body"]) == {"item_id": 42}

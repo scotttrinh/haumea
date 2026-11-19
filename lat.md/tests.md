@@ -117,3 +117,7 @@ Covers ancestors missing `uv.lock` or `[tool.uv.workspace]`, standalone projects
 ## Workspace build
 
 Verify [[src/haumea/build.py#build]] on a uv workspace with `apps/api`, `packages/core`, and an unrelated `apps/worker`/`packages/unused` sibling resolves `workspace_root`, vendors `core` non-editably, omits `api` and `unused`, and serves `core` via `vc_handler`.
+
+## Full-stack example build
+
+Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.12 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions, and invokes each built function standalone.
