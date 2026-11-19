@@ -1,7 +1,7 @@
 from haumea.app import Haumea
 from haumea.config import HaumeaConfig, load_config
 from haumea.exceptions import HTTPException, RequestValidationError
-from haumea.params import Body, Cookie, Depends, Header, Query
+from haumea.params import Body, Cookie, Depends, Header, Query, lazy
 from haumea.requests import Geo, Request
 from haumea.responses import (
     HTMLResponse,
@@ -37,5 +37,6 @@ __all__ = [
     "StreamingResponse",
     "create_app",
     "create_route_app",
+    "lazy",
     "load_config",
 ]

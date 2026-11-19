@@ -52,3 +52,15 @@ Each `;`-separated pair splits on its first `=`, so values may contain `=`; name
 `Geo.region` reads `x-vercel-ip-country-region`, Vercel's ISO 3166-2 region code (`countryRegion` in `@vercel/functions`); there is no `x-vercel-ip-region` header, and the edge region lives in `x-vercel-id`. Vercel percent-encodes non-ASCII city names (RFC 3986), so `city` is decoded with `urllib.parse.unquote`.
 
 Vercel sets these headers at the edge, but outside Vercel they come straight from the client, so they must not be trusted for authorization.
+
+## Lazy Values
+
+[[src/haumea/params.py#lazy]] turns a zero-argument `factory` into a callable that creates a process-wide value (a client or pool) on first call, in place of startup hooks.
+
+- **Sync factories**: creation runs under a `threading.Lock` with a double check against a private sentinel, so concurrent first calls run `factory` once and `None` or falsy values are cached too.
+- **Async factories**: [[src/haumea/params.py#_is_async]] treats coroutine functions and instances with `async def __call__` as async. The callable is then a coroutine function, so [[src/haumea/params.py#Endpoint#_call]] awaits it.
+- **Shared creation**: the first call starts a task on its own loop that calls and awaits `factory()`, and publishes the outcome to a `concurrent.futures.Future`. Every caller awaits that through `asyncio.wrap_future` and `asyncio.shield`, so callers on other threads' event loops share the creation, and cancelling one caller leaves it running for the others. Once settled, calls return the stored value directly.
+- **Task lifetime**: the shared state holds the creation task alongside its future until it settles, since event loops only keep weak references to tasks and the initiating caller may be cancelled and garbage-collected.
+- **Abandoned waiters**: a cancelled caller attaches [[src/haumea/params.py#_retrieve]] to its `wrap_future` waiter, because `shield` stops watching the inner future once the caller is cancelled. A later failure is then not logged as an unretrieved exception, and active waiters still get the error.
+- **Failures**: if `factory` raises, even synchronously from a function marked with `inspect.markcoroutinefunction`, nothing is cached. Callers sharing that attempt get the error, and the next call tries again. If the creating task is cancelled (for example its `asyncio.run` loop ends first), waiters get `CancelledError` and the next call retries.
+- **As a dependency**: [[src/haumea/params.py#_named]] copies the factory's name and docstring but not `__wrapped__`, so `inspect.signature` reports no parameters and `Depends(lazy(factory))` adds no request inputs. Its per-request cache key is the `lazy` callable itself.

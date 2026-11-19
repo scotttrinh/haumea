@@ -98,10 +98,15 @@ def openapi_schema(app: Haumea) -> dict[str, Any]:
     components: dict[str, Any] = {}
     paths: dict[str, Any] = {}
     for path, _, endpoints in app.routes:
-        paths[path.replace(":path}", "}")] = {
+        # Components are collected only from documented operations, so a
+        # schema used solely by hidden ones is left out too.
+        operations = {
             method.lower(): _operation(method, path, endpoint, components)
             for method, endpoint in endpoints.items()
+            if (path, method) not in app.hidden_operations
         }
+        if operations:
+            paths[path.replace(":path}", "}")] = operations
     schema: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {"title": app.title, "version": app.version},

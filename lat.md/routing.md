@@ -42,3 +42,9 @@ Matching always uses the full public path from [[src/haumea/requests.py#Request#
 - **Dev docs & static files**: [[src/haumea/app.py#Haumea#_dev_file]] follows the build's precedence and rejects non-`GET`/`HEAD` requests with `405` before generating OpenAPI or reading file bytes. If `docs=True`, the generated `{base_path}/openapi.json` and `{base_path}/docs.html` win over `public/` copies, as [[src/haumea/build.py#_write_static]] writes them over `public/`. `{base_path}/docs` is the Swagger UI (loading the prefixed `openapi.json`) only when `public/docs` does not exist, because the `filesystem` check runs before the docs rewrite. [[src/haumea/app.py#Haumea#_static_file]] serves files from `public_dir`, guarding against path traversal with `Path.is_relative_to`. Under a prefix it only serves paths strictly under `{base_path}/`, so `/hello.txt` and `/apiary/hello.txt` get the JSON 404. Paths ending in `/`, symlink loops and NUL bytes are not files.
 
 *Note on non-obvious behavior*: [[src/haumea/app.py#Haumea#__call__]] ignores non-`http`/non-`lifespan` ASGI scopes (e.g. `websocket`) by returning immediately.
+
+## Schema Visibility
+
+A route module may set `include_in_schema = False` to keep its operations out of `openapi.json` while still serving them.
+
+[[src/haumea/routing.py#_include_in_schema]] reads the module-level value, defaulting to `True` and raising `TypeError` for anything that is not a `bool`. [[src/haumea/routing.py#_add_route]] passes it to [[src/haumea/app.py#Haumea#add_route]], which records hidden `(path, method)` pairs in the `hidden_operations` set of [[src/haumea/app.py#Haumea]]. Dispatch ignores that set; only [[src/haumea/openapi.py#openapi_schema]] reads it. Dev and the build's static `openapi.json` both come from [[src/haumea/routing.py#create_app]], so they agree.

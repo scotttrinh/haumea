@@ -251,3 +251,65 @@ Verify that with two raw `x-forwarded-for` header tuples [[src/haumea/requests.p
 ## Platform request id under concurrent reads
 
 Verify that threads released together by a barrier all read the same generated `request.id` from one `Request`, repeated over many requests to expose races.
+
+## Hidden routes leave the schema
+
+Verify `include_in_schema = False` drops a route's operations and its exclusive component schemas from dev `/openapi.json` and the build's static `openapi.json`, keeps shared schemas, and still serves the route in dev and as a deployed function.
+
+## Schema with only hidden routes
+
+Verify that when every route is hidden, `openapi.json` has empty `paths` and no `components`, while the hidden route still answers requests.
+
+## Invalid include_in_schema
+
+Verify a non-`bool` `include_in_schema` (a string, `0` or `None`) fails app creation with a `TypeError` naming the setting, instead of being read as truthy or falsy.
+
+## Lazy values
+
+Tests for [[src/haumea/params.py#lazy]]: one creation per process for sync and async factories, retry after failure, and use as a dependency.
+
+### Sync lazy creates once
+
+Verify 16 threads released by a barrier get the same value from one `factory` call, including `None` and falsy values, and later calls reuse it.
+
+### Async lazy creates once
+
+Verify `asyncio.gather` callers share one creation, the callable is a coroutine function, and the value is reused from later event loops without calling `factory` again.
+
+### Failed creation is not cached
+
+Verify a sync `factory` that raises is retried on the next call, and that async callers sharing a failed attempt all get its error while the next call starts a fresh attempt.
+
+### Cancelled waiter keeps creation
+
+Verify cancelling one caller awaiting an async creation does not cancel it: another caller still gets the value and `factory` runs once.
+
+### Lazy as a dependency
+
+Verify sync and async `lazy` callables work with `Depends` (as a default and in `Annotated`) in sync and async handlers through `create_app`, creating once across requests and adding no OpenAPI parameters from the factory's own defaults.
+
+### Lazy exports
+
+Verify `lazy` is exported from `haumea` and `haumea.params`, and that a sync `lazy` callable has an empty signature and is not a coroutine function.
+
+### Async lazy across event loops
+
+Verify two threads each running `asyncio.run` share one in-flight async creation started on the other thread's loop, get the same value, and call `factory` once.
+
+The second loop sets an event via `call_soon` just before awaiting, so the creation is only released once that caller is suspended on it.
+
+### Async callable instance factory
+
+Verify `Depends(lazy(Pool()))` where `Pool` has `async def __call__` awaits the factory through `create_app`, returning its value rather than a coroutine, created once across requests.
+
+### Async factory raising synchronously
+
+Verify a `markcoroutinefunction` factory that raises before returning an awaitable fails that call, leaves no unresolved attempt behind, and lets the next call create the value.
+
+### Creation outlives its initiator
+
+Verify that after the initiating caller is cancelled and dropped and `gc.collect()` runs, the creation task survives (its awaited future is only weakly referenced by the test), another caller gets the value, and asyncio logs no errors.
+
+### Abandoned waiter after failure
+
+Verify that when a cancelled caller's creation later fails, an active caller still gets the error and asyncio logs no unretrieved-exception error after `gc.collect()`.

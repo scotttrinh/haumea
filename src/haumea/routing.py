@@ -120,12 +120,29 @@ def discover_routes(app_dir: str | Path, base_path: str = "") -> list[Route]:
     return sorted(routes, key=lambda route: (route.rank, route.url_path, route.file))
 
 
+def _include_in_schema(module: ModuleType, route: Route) -> bool:
+    """Read module-level ``include_in_schema``, which defaults to ``True``."""
+    include = getattr(module, "include_in_schema", True)
+    if not isinstance(include, bool):
+        raise TypeError(
+            f"invalid `include_in_schema` in {route.file}: expected a bool, "
+            f"got {include!r}"
+        )
+    return include
+
+
 def _add_route(app: Haumea, route: Route) -> None:
     module = route.load()
+    include_in_schema = _include_in_schema(module, route)
     for method in HTTP_METHODS:
         handler = getattr(module, method, None)
         if callable(handler):
-            app.add_route(route.url_path, handler, methods=[method])
+            app.add_route(
+                route.url_path,
+                handler,
+                methods=[method],
+                include_in_schema=include_in_schema,
+            )
 
 
 def create_app(

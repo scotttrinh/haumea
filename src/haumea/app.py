@@ -52,17 +52,30 @@ class Haumea:
         self.docs = docs
         self.public_dir = Path(public_dir).resolve() if public_dir else None
         self.routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]] = []
+        self.hidden_operations: set[tuple[str, str]] = set()
+        """``(path, method)`` pairs served but left out of the OpenAPI schema."""
 
     def add_route(
-        self, path: str, handler: Callable[..., Any], methods: list[str]
+        self,
+        path: str,
+        handler: Callable[..., Any],
+        methods: list[str],
+        *,
+        include_in_schema: bool = True,
     ) -> None:
-        """Register ``handler`` for ``path``."""
+        """Register ``handler`` for ``path``; ``include_in_schema=False``
+        serves it without documenting it in OpenAPI."""
         endpoint = Endpoint(handler, {m[1] for m in _PATH_PARAM.finditer(path)})
         endpoints = next((e for p, _, e in self.routes if p == path), None)
         if endpoints is None:
             endpoints = {}
             self.routes.append((path, _compile_path(path), endpoints))
-        endpoints.update({method.upper(): endpoint for method in methods})
+        for method in map(str.upper, methods):
+            endpoints[method] = endpoint
+            if include_in_schema:
+                self.hidden_operations.discard((path, method))
+            else:
+                self.hidden_operations.add((path, method))
 
     def openapi(self) -> dict[str, Any]:
         return openapi_schema(self)

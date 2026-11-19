@@ -7,17 +7,21 @@
 - anything else is a query parameter
 
 ``Query()``, ``Header()``, ``Cookie()`` and ``Body()`` override the inferred source.
+``lazy(factory)`` makes a process-wide value usable as ``Depends(...)``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
+import functools
 import inspect
 import re
-from collections.abc import Callable, Iterator
+import threading
+from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass
-from typing import Annotated, Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin, overload
 
 import msgspec
 
@@ -60,6 +64,112 @@ def Cookie(default: Any = ..., *, alias: str | None = None) -> Any:
 
 def Body(default: Any = ..., *, alias: str | None = None) -> Any:
     return ParamInfo("body", default, alias)
+
+
+@overload
+def lazy[T](
+    factory: Callable[[], Coroutine[Any, Any, T]],
+) -> Callable[[], Coroutine[Any, Any, T]]: ...
+@overload
+def lazy[T](factory: Callable[[], T]) -> Callable[[], T]: ...
+def lazy(factory: Callable[[], Any]) -> Callable[[], Any]:
+    """A zero-argument callable that creates its value with ``factory()`` on
+    first call and returns that value for the life of the process.
+
+    Creation runs under a lock, so concurrent first calls run ``factory``
+    once. For an async ``factory`` (a coroutine function or an instance with
+    ``async def __call__``) the first call's task is shared: callers await
+    it, even from other threads' event loops, and cancelling one caller does
+    not cancel the creation. If ``factory`` raises, nothing is cached and
+    the next call tries again.
+
+    The callable takes no parameters, so ``Depends(lazy(factory))`` adds no
+    request inputs even when ``factory`` has defaulted parameters.
+    """
+    lock = threading.Lock()
+    value: Any = _MISSING
+
+    if not _is_async(factory):
+
+        def get():
+            nonlocal value
+            if value is _MISSING:
+                with lock:
+                    if value is _MISSING:
+                        value = factory()
+            return value
+
+        return _named(get, factory)
+
+    # A concurrent.futures.Future, unlike an asyncio one, can be awaited from
+    # any thread's event loop, so overlapping loops share one creation. The
+    # task is held here too: the event loop keeps only weak references to
+    # tasks, and the caller that started it may be cancelled and dropped.
+    pending: tuple[concurrent.futures.Future[Any], asyncio.Task[Any]] | None = None
+
+    async def create() -> Any:
+        # Calling factory() in the task body makes a synchronous raise fail
+        # this attempt like any other error.
+        return await factory()
+
+    def settle(future: concurrent.futures.Future[Any], task: asyncio.Task[Any]):
+        nonlocal pending, value
+        with lock:
+            pending = None
+            if not task.cancelled() and task.exception() is None:
+                value = task.result()
+        if task.cancelled():
+            future.cancel()
+        elif (error := task.exception()) is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(task.result())
+
+    async def aget():
+        nonlocal pending
+        if value is not _MISSING:
+            return value
+        with lock:
+            if value is not _MISSING:
+                return value
+            if pending is None:
+                task = asyncio.ensure_future(create())
+                future = concurrent.futures.Future()
+                task.add_done_callback(functools.partial(settle, future))
+                pending = (future, task)
+            future, _ = pending
+        waiter = asyncio.wrap_future(future)
+        try:
+            # shield: cancelling this caller must not cancel the shared future.
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            # Nobody awaits the abandoned waiter now, so retrieve its outcome
+            # to keep asyncio from reporting an unretrieved exception.
+            waiter.add_done_callback(_retrieve)
+            raise
+
+    return _named(aget, factory)
+
+
+def _retrieve(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _is_async(factory: Callable[..., Any]) -> bool:
+    """A coroutine function, or an instance whose ``__call__`` is one."""
+    return inspect.iscoroutinefunction(factory) or inspect.iscoroutinefunction(
+        type(factory).__call__
+    )
+
+
+def _named(func: Callable[[], Any], factory: Callable[..., Any]) -> Callable[[], Any]:
+    """Copy ``factory``'s name and docs without ``__wrapped__``, which would
+    make ``inspect.signature`` report the factory's parameters."""
+    for attr in ("__module__", "__name__", "__qualname__", "__doc__"):
+        if hasattr(factory, attr):
+            setattr(func, attr, getattr(factory, attr))
+    return func
 
 
 @dataclass
