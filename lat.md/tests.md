@@ -137,3 +137,15 @@ Covers a synthetic store fixture (including `top_level.txt`, namespace packages,
 Verify [[src/haumea/build.py#SIZE_WARN_BYTES]], [[src/haumea/build.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/haumea/build.py#build]] and [[src/haumea/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
 
 Lowers thresholds via `monkeypatch` to confirm warning messages name the largest distributions in descending size order while letting the build succeed, and that exceeding the fail limit raises `RuntimeError` naming the oversized function and largest distributions.
+
+## Per-function tree-shaking
+
+Verify [[src/haumea/build.py#build]] on a multi-package uv workspace bundles only each route's traced dependencies plus `haumea`, `vercel-runtime`, and their closures, invokes every built function standalone via `vc_handler`, and honors `include` and `tree_shake = false`.
+
+Covers recursive project helpers with relative imports and cycles, transitive `Requires-Dist`, lazy imports inside handlers, skipped `TYPE_CHECKING` blocks, `importlib.import_module` and `__import__` string literals, route and project `include`, hard-linking across functions, per-function reported distribution counts, and `tree_shake = false` restoring the full store.
+
+## Import tracer and closure
+
+Verify [[src/haumea/build.py#trace_function]], [[src/haumea/build.py#resolve_closure]], [[src/haumea/build.py#ALWAYS_INCLUDED]], and [[src/haumea/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
+
+Covers `vercel-functions` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.

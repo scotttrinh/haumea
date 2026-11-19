@@ -17,13 +17,15 @@ With ``base_path = "/api"`` in ``[tool.haumea]``, function paths, ``static/``
 files and rewrites are all prefixed: ``functions/api.func``,
 ``static/api/docs.html``, ``^/api/docs$``.
 
-Every function carries the same source and dependencies (hard-linked on disk)
-and differs only in its entrypoint and ``.vc-config.json``. The function
-layout mirrors what Vercel's own Python builder produces.
+Every function carries the project source and its own tree-shaken subset of
+dependencies (hard-linked on disk from a shared store), differing in its
+entrypoint, ``.vc-config.json`` and ``_vendor/``. The function layout mirrors
+what Vercel's own Python builder produces.
 """
 
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import os
@@ -31,12 +33,15 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import warnings
-from collections.abc import Callable, Mapping
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from email.parser import HeaderParser
 from pathlib import Path
+from types import ModuleType
 
 from haumea.config import PYPROJECT, HaumeaConfig, load_config, read_pyproject
 from haumea.openapi import swagger_html
@@ -55,6 +60,13 @@ DEFAULT_PYTHON = "3.12"
 # Vercel's maximum uncompressed Python function size is 500 MB.
 SIZE_WARN_BYTES = 250 * 1024 * 1024
 SIZE_LIMIT_BYTES = 500 * 1024 * 1024
+
+# Distributions (and closures) always bundled when present in the store.
+ALWAYS_INCLUDED: tuple[str, ...] = (
+    "haumea",
+    "vercel-runtime",
+    "vercel-functions",
+)
 
 IGNORE = shutil.ignore_patterns(
     ".*", "__pycache__", "*.pyc", "public", "node_modules", "tests", "uv.lock"
@@ -372,6 +384,10 @@ class FunctionSpec:
     """Source of the function's ``index.py``."""
     vc_config: dict[str, object]
     """Content of the function's ``.vc-config.json``."""
+    trace_roots: tuple[Path, ...] = ()
+    """Project source files traced for this function (starting with ``route.py``)."""
+    include: tuple[str, ...] = ()
+    """PEP 503 normalized distribution names from module-level ``include``."""
 
 
 @dataclass(frozen=True)
@@ -444,6 +460,26 @@ def _dump_json(value: object, *, indent: int | None = None) -> str:
         return json.dumps(_sort_keys(value), indent=indent)
 
 
+def _read_route_include(module: ModuleType, route: Route) -> tuple[str, ...]:
+    """Read and normalize module-level ``include`` from a loaded route module."""
+    if not hasattr(module, "include"):
+        return ()
+    raw = module.include
+    if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
+        raise ValueError(
+            f"invalid `include` in {route.file}: expected a sequence of strings"
+        )
+    names: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"invalid `include` entry {item!r} in {route.file}: "
+                "expected a non-empty string"
+            )
+        names.append(normalize_dist_name(item.strip()))
+    return tuple(dict.fromkeys(names))
+
+
 def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
     module = route.load()
     config: dict[str, object] = {
@@ -462,6 +498,8 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
             function=route.function, base_path=base_path
         ),
         vc_config=config,
+        trace_roots=(route.file,),
+        include=_read_route_include(module, route),
     )
 
 
@@ -657,6 +695,371 @@ def _report_functions(reports: list[FunctionReport], store: StoreIndex) -> None:
         raise RuntimeError("\n".join(oversized))
 
 
+@dataclass(frozen=True)
+class _ImportRef:
+    module: str | None
+    level: int
+    names: tuple[str, ...] = ()
+    package: tuple[str, ...] | None = None
+
+
+def _is_type_checking_guard(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "TYPE_CHECKING"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "TYPE_CHECKING"
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+        return any(_is_type_checking_guard(value) for value in node.values)
+    return False
+
+
+def _call_arg(call: ast.Call, pos: int, kw: str) -> ast.expr | None:
+    if pos < len(call.args):
+        return call.args[pos]
+    for keyword in call.keywords:
+        if keyword.arg == kw:
+            return keyword.value
+    return None
+
+
+def _str_literal(node: ast.expr | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+class _ImportCollector(ast.NodeVisitor):
+    """Collect runtime imports from one module AST, skipping ``TYPE_CHECKING``."""
+
+    def __init__(self) -> None:
+        self.imports: list[_ImportRef] = []
+        self.calls: list[ast.Call] = []
+        self.importlib_aliases: set[str] = {"importlib"}
+        self.import_module_aliases: set[str] = set()
+        self.builtins_aliases: set[str] = {"builtins"}
+        self.dunder_import_aliases: set[str] = {"__import__"}
+
+    def visit_If(self, node: ast.If) -> None:
+        if _is_type_checking_guard(node.test):
+            for stmt in node.orelse:
+                self.visit(stmt)
+            return
+        if (
+            isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and _is_type_checking_guard(node.test.operand)
+        ):
+            for stmt in node.body:
+                self.visit(stmt)
+            return
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.imports.append(_ImportRef(module=alias.name, level=0))
+            if alias.name == "importlib":
+                self.importlib_aliases.add(alias.asname or "importlib")
+            elif alias.name == "builtins":
+                self.builtins_aliases.add(alias.asname or "builtins")
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        names = tuple(alias.name for alias in node.names if alias.name != "*")
+        self.imports.append(
+            _ImportRef(module=node.module, level=node.level, names=names)
+        )
+        if node.level == 0 and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    self.import_module_aliases.add(alias.asname or "import_module")
+                elif alias.name == "*":
+                    self.import_module_aliases.add("import_module")
+        elif node.level == 0 and node.module == "builtins":
+            for alias in node.names:
+                if alias.name == "__import__":
+                    self.dunder_import_aliases.add(alias.asname or "__import__")
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.calls.append(node)
+        self.generic_visit(node)
+
+    def resolve_calls(self) -> None:
+        for call in self.calls:
+            func = call.func
+            is_import_module = (
+                isinstance(func, ast.Attribute)
+                and func.attr == "import_module"
+                and isinstance(func.value, ast.Name)
+                and func.value.id in self.importlib_aliases
+            ) or (isinstance(func, ast.Name) and func.id in self.import_module_aliases)
+            if is_import_module:
+                ref = _parse_import_module_call(call)
+                if ref is not None:
+                    self.imports.append(ref)
+                continue
+
+            is_dunder_import = (
+                isinstance(func, ast.Name) and func.id in self.dunder_import_aliases
+            ) or (
+                isinstance(func, ast.Attribute)
+                and func.attr == "__import__"
+                and isinstance(func.value, ast.Name)
+                and func.value.id in self.builtins_aliases
+            )
+            if is_dunder_import:
+                ref = _parse_dunder_import_call(call)
+                if ref is not None:
+                    self.imports.append(ref)
+
+
+def _parse_import_module_call(call: ast.Call) -> _ImportRef | None:
+    name = _str_literal(_call_arg(call, 0, "name"))
+    if not name:
+        return None
+    if name.startswith("."):
+        level = len(name) - len(name.lstrip("."))
+        mod = name[level:] or None
+        pkg_arg = _call_arg(call, 1, "package")
+        if isinstance(pkg_arg, ast.Name) and pkg_arg.id == "__package__":
+            return _ImportRef(module=mod, level=level)
+        pkg_str = _str_literal(pkg_arg)
+        if pkg_str:
+            pkg_parts = tuple(part for part in pkg_str.split(".") if part)
+            if pkg_parts:
+                return _ImportRef(module=mod, level=level, package=pkg_parts)
+        return None
+    return _ImportRef(module=name, level=0)
+
+
+def _parse_dunder_import_call(call: ast.Call) -> _ImportRef | None:
+    name = _str_literal(_call_arg(call, 0, "name"))
+    if name is None:
+        return None
+    level_arg = _call_arg(call, 4, "level")
+    if level_arg is None:
+        level = 0
+    elif (
+        isinstance(level_arg, ast.Constant)
+        and type(level_arg.value) is int
+        and level_arg.value >= 0
+    ):
+        level = level_arg.value
+    else:
+        return None
+
+    names: tuple[str, ...] = ()
+    fromlist_arg = _call_arg(call, 3, "fromlist")
+    if isinstance(fromlist_arg, (ast.List, ast.Tuple)):
+        names = tuple(
+            elt.value
+            for elt in fromlist_arg.elts
+            if isinstance(elt, ast.Constant)
+            and isinstance(elt.value, str)
+            and elt.value
+            and elt.value != "*"
+        )
+    if level == 0 and not name:
+        return None
+    return _ImportRef(module=name or None, level=level, names=names)
+
+
+def _extract_imports(source: str | bytes, filename: str) -> list[_ImportRef]:
+    tree = ast.parse(source, filename=filename)
+    collector = _ImportCollector()
+    collector.visit(tree)
+    collector.resolve_calls()
+    return collector.imports
+
+
+def _package_parts(file_path: Path, project_dir: Path) -> tuple[str, ...]:
+    try:
+        return file_path.resolve().parent.relative_to(project_dir).parts
+    except ValueError:
+        return ()
+
+
+def _resolve_project_modules(parts: tuple[str, ...], project_dir: Path) -> list[Path]:
+    """Resolve dotted module ``parts`` to project files inside ``project_dir``,
+    including intermediate package ``__init__.py`` files."""
+    if not parts or any(
+        not part or part in (".", "..") or "/" in part or "\\" in part for part in parts
+    ):
+        return []
+    py_file = project_dir.joinpath(*parts[:-1], f"{parts[-1]}.py")
+    init_file = project_dir.joinpath(*parts, "__init__.py")
+    if py_file.is_file():
+        target = py_file.resolve()
+    elif init_file.is_file():
+        target = init_file.resolve()
+    else:
+        return []
+    if not target.is_relative_to(project_dir):
+        return []
+
+    files: list[Path] = []
+    for i in range(1, len(parts)):
+        parent_init = project_dir.joinpath(*parts[:i], "__init__.py")
+        if parent_init.is_file():
+            resolved_parent = parent_init.resolve()
+            if resolved_parent.is_relative_to(project_dir):
+                files.append(resolved_parent)
+    files.append(target)
+    return files
+
+
+def _resolve_import_ref(
+    ref: _ImportRef,
+    current_package: tuple[str, ...],
+    project_dir: Path,
+    store: StoreIndex,
+) -> tuple[list[Path], tuple[str, ...]]:
+    """Resolve one ``_ImportRef`` to project files to recurse into and/or
+    distribution names from ``store``."""
+    mod_parts = (
+        tuple(part for part in ref.module.split(".") if part) if ref.module else ()
+    )
+    if ref.level > 0:
+        base_pkg = ref.package if ref.package is not None else current_package
+        up = ref.level - 1
+        if up > len(base_pkg):
+            return [], ()
+        target_parts = (*base_pkg[: len(base_pkg) - up], *mod_parts)
+        allow_store = ref.package is not None
+    else:
+        if not mod_parts:
+            return [], ()
+        target_parts = mod_parts
+        allow_store = True
+
+    project_files: list[Path] = []
+    if target_parts:
+        project_files.extend(_resolve_project_modules(target_parts, project_dir))
+    for name in ref.names:
+        project_files.extend(
+            _resolve_project_modules((*target_parts, name), project_dir)
+        )
+    if project_files or not allow_store or not target_parts:
+        return project_files, ()
+    top = target_parts[0]
+    if top in sys.stdlib_module_names:
+        return [], ()
+    return [], store.by_import.get(top, ())
+
+
+def trace_function(
+    spec: FunctionSpec, project_dir: Path, store: StoreIndex
+) -> frozenset[str]:
+    """Statically trace ``spec.trace_roots`` and ``spec.entrypoint``, following
+    project modules recursively and returning matched distribution names."""
+    project_root = project_dir.resolve()
+    visited: set[Path] = set()
+    queue: deque[Path] = deque()
+    distributions: set[str] = set()
+
+    def enqueue_files(paths: Iterable[Path]) -> None:
+        for path in paths:
+            resolved = path.resolve()
+            if resolved not in visited and resolved.is_file():
+                visited.add(resolved)
+                queue.append(resolved)
+
+    def process_refs(refs: list[_ImportRef], current_package: tuple[str, ...]) -> None:
+        for ref in refs:
+            files, dists = _resolve_import_ref(
+                ref, current_package, project_root, store
+            )
+            enqueue_files(files)
+            distributions.update(dists)
+
+    # Trace generated entrypoint (imports haumea) plus every file trace root.
+    process_refs(_extract_imports(spec.entrypoint, str(project_root / ENTRYPOINT)), ())
+    enqueue_files(spec.trace_roots)
+
+    while queue:
+        current = queue.popleft()
+        package = _package_parts(current, project_root)
+        process_refs(_extract_imports(current.read_bytes(), str(current)), package)
+
+    return frozenset(distributions)
+
+
+def resolve_closure(seeds: Iterable[str], store: StoreIndex) -> tuple[str, ...]:
+    """Return the sorted transitive closure of ``seeds`` over ``Requires-Dist``
+    for distributions present in ``store``."""
+    included: set[str] = set()
+    queue: deque[str] = deque()
+    for raw in seeds:
+        name = normalize_dist_name(raw)
+        if name in store.distributions and name not in included:
+            included.add(name)
+            queue.append(name)
+    while queue:
+        current = queue.popleft()
+        for req in store.distributions[current].requires:
+            if req in store.distributions and req not in included:
+                included.add(req)
+                queue.append(req)
+    return tuple(sorted(included))
+
+
+def resolve_distributions(
+    spec: FunctionSpec,
+    project_dir: Path,
+    config: HaumeaConfig,
+    store: StoreIndex,
+) -> tuple[str, ...]:
+    """Compute the final sorted distributions to bundle for ``spec``."""
+    seeds = (
+        *trace_function(spec, project_dir, store),
+        *ALWAYS_INCLUDED,
+        *config.include,
+        *spec.include,
+    )
+    return resolve_closure(seeds, store)
+
+
+def _link_distributions(
+    store_dir: Path,
+    vendor_dest: Path,
+    distributions: tuple[str, ...],
+    store: StoreIndex,
+) -> None:
+    """Hard-link every ``RECORD`` file and ``.dist-info`` directory for
+    ``distributions`` from ``store_dir`` into ``vendor_dest``."""
+    if not store_dir.is_dir():
+        return
+    vendor_dest.mkdir(parents=True, exist_ok=True)
+    linked: set[str] = set()
+
+    def link_file(rel: str) -> None:
+        if rel in linked:
+            return
+        src = store_dir / rel
+        if src.is_symlink():
+            dest = vendor_dest / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.readlink(src), dest)
+            linked.add(rel)
+        elif src.is_file():
+            dest = vendor_dest / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.link(src, dest)
+            linked.add(rel)
+
+    for name in distributions:
+        dist = store.distributions.get(name)
+        if dist is None:
+            continue
+        for rel in dist.files:
+            link_file(rel)
+        dist_info_dir = store_dir / dist.dist_info
+        if dist_info_dir.is_dir():
+            for root, _dirs, filenames in os.walk(dist_info_dir, followlinks=False):
+                root_path = Path(root)
+                for filename in filenames:
+                    rel = (root_path / filename).relative_to(store_dir).as_posix()
+                    link_file(rel)
+
+
 def _write_function(spec: FunctionSpec, shared: Path, functions_dir: Path) -> Path:
     func_dir = functions_dir / f"{spec.name}.func"
     func_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -693,31 +1096,47 @@ def emit_build(plan: BuildPlan) -> Path:
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
-    # Assemble what every function shares once, then hard-link it into each.
-    # Keep the staging directory inside output so os.link stays on the same
-    # filesystem and copytree excludes both output and staging together.
+    # Assemble shared project source and the dependency store once, then
+    # hard-link each function's files from them. Keep the staging directory
+    # inside output so os.link stays on the same filesystem and copytree
+    # excludes both output and staging together.
     with tempfile.TemporaryDirectory(dir=output, prefix=".haumea-") as tmp:
         shared = Path(tmp) / "shared"
         shutil.copytree(plan.project_dir, shared, ignore=_ignore_path(output, IGNORE))
         (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
-        vendor_dir = shared / VENDOR_DIR
+        store_dir = Path(tmp) / "store"
         _install_dependencies(
             plan.workspace_root,
-            vendor_dir,
+            store_dir,
             plan.python,
             plan.platform,
             plan.package,
         )
-        store = index_store(vendor_dir)
+        store = index_store(store_dir)
         all_distributions = tuple(store.distributions)
         reports: list[FunctionReport] = []
         for spec in plan.functions:
             func_dir = _write_function(spec, shared, output / "functions")
+            vendor_dest = func_dir / VENDOR_DIR
+            if plan.config.tree_shake:
+                distributions = resolve_distributions(
+                    spec, plan.project_dir, plan.config, store
+                )
+                _link_distributions(store_dir, vendor_dest, distributions, store)
+            else:
+                distributions = all_distributions
+                if store_dir.is_dir():
+                    shutil.copytree(
+                        store_dir,
+                        vendor_dest,
+                        copy_function=os.link,
+                        dirs_exist_ok=True,
+                    )
             reports.append(
                 FunctionReport(
                     name=spec.name,
                     size=_dir_size(func_dir),
-                    distributions=all_distributions,
+                    distributions=distributions,
                 )
             )
 

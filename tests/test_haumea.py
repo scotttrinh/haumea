@@ -229,6 +229,10 @@ def test_build_plan(tmp_path, isolated_imports):
         "supportsResponseStreaming",
         "environment",
     }
+    assert orders.trace_roots == (orders.route.file,)
+    assert orders.include == ()
+    assert order.trace_roots == (order.route.file,)
+    assert order.include == ()
 
     static = {f.path: f.content for f in plan.static_files}
     assert set(static) == {"openapi.json", "docs.html"}
@@ -1389,7 +1393,10 @@ def test_build_size_report_and_limits(tmp_path, isolated_imports, monkeypatch, c
     write_project(
         project,
         {
-            "pyproject.toml": '[project]\nname = "sized"\nversion = "0"\n',
+            "pyproject.toml": (
+                '[project]\nname = "sized"\nversion = "0"\n\n'
+                '[tool.haumea]\ninclude = ["big-pkg", "med-pkg", "small-pkg"]\n'
+            ),
             "app/route.py": "def GET():\n    return {'ok': True}\n",
             "app/ping/route.py": "def GET():\n    return {'ping': True}\n",
         },
@@ -1483,3 +1490,443 @@ def test_build_size_report_and_limits(tmp_path, isolated_imports, monkeypatch, c
     assert "ping" in cli_out
     assert "3 distributions" in cli_out
     assert "Build output written to" in cli_out
+
+
+def _write_workspace_pkg(
+    workspace: Path,
+    dist_name: str,
+    module_name: str,
+    source: str,
+    *,
+    deps: list[str] | None = None,
+) -> None:
+    dep_list = deps or []
+    sources_block = ""
+    if dep_list:
+        entries = "\n".join(f"{dep} = {{ workspace = true }}" for dep in dep_list)
+        sources_block = f"\n[tool.uv.sources]\n{entries}\n"
+    write_project(
+        workspace / "packages" / dist_name,
+        {
+            "pyproject.toml": (
+                f'[project]\nname = "{dist_name}"\nversion = "0.1.0"\n'
+                f'requires-python = ">=3.12"\n'
+                f"dependencies = {json.dumps(dep_list)}\n\n"
+                '[build-system]\nrequires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n'
+                f"{sources_block}"
+            ),
+            f"src/{module_name}/__init__.py": source,
+        },
+    )
+
+
+# @lat: [[tests#Per-function tree-shaking]]
+def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, capsys):
+    from haumea.build import index_store
+
+    repo_root = Path(__file__).parent.parent.resolve()
+    workspace = tmp_path / "shaken-ws"
+    write_project(
+        workspace,
+        {
+            "pyproject.toml": (
+                '[tool.uv.workspace]\nmembers = ["apps/*", "packages/*"]\n'
+            ),
+        },
+    )
+    _write_workspace_pkg(workspace, "pkg-trans", "pkg_trans", 'VALUE = "from-trans"\n')
+    _write_workspace_pkg(
+        workspace,
+        "pkg-a",
+        "pkg_a",
+        (
+            "import pkg_trans\n\n"
+            'def describe() -> str:\n    return f"pkg-a+{pkg_trans.VALUE}"\n'
+        ),
+        deps=["pkg-trans"],
+    )
+    _write_workspace_pkg(
+        workspace,
+        "pkg-b",
+        "pkg_b",
+        'def describe() -> str:\n    return "pkg-b"\n',
+    )
+    _write_workspace_pkg(
+        workspace,
+        "pkg-c",
+        "pkg_c",
+        'def describe() -> str:\n    return "pkg-c"\n',
+    )
+    _write_workspace_pkg(
+        workspace,
+        "pkg-d",
+        "pkg_d",
+        'def describe() -> str:\n    return "pkg-d"\n',
+    )
+
+    base_pyproject = (
+        '[project]\nname = "api"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.12"\n'
+        'dependencies = ["haumea", "pkg-a", "pkg-b", "pkg-c", "pkg-d"]\n\n'
+        "[tool.uv.sources]\n"
+        f"haumea = {{ path = {json.dumps(repo_root.as_posix())}, editable = true }}\n"
+        "pkg-a = { workspace = true }\n"
+        "pkg-b = { workspace = true }\n"
+        "pkg-c = { workspace = true }\n"
+        "pkg-d = { workspace = true }\n"
+    )
+    write_project(
+        workspace / "apps" / "api",
+        {
+            "pyproject.toml": base_pyproject,
+            "helpers/__init__.py": "",
+            "helpers/chain.py": (
+                "from . import leaf\n"
+                "from .cycle import TAG\n\n"
+                "def run() -> str:\n"
+                '    return f"{leaf.run()}:{TAG}"\n'
+            ),
+            "helpers/cycle.py": (
+                'TAG = "ok"\n\n'
+                "def touch():\n"
+                "    from . import chain\n"
+                "    return chain\n"
+            ),
+            "helpers/leaf.py": (
+                "import pkg_a\n\ndef run() -> str:\n    return pkg_a.describe()\n"
+            ),
+            "app/alpha/route.py": (
+                "import typing\n"
+                "from typing import TYPE_CHECKING\n"
+                "from helpers.chain import run\n\n"
+                "if TYPE_CHECKING:\n"
+                "    import pkg_d\n"
+                "if typing.TYPE_CHECKING:\n"
+                "    import pkg_b\n\n"
+                "def GET():\n"
+                '    return {"result": run()}\n'
+            ),
+            "app/beta/route.py": (
+                "def GET():\n"
+                "    import pkg_b\n"
+                '    return {"result": pkg_b.describe()}\n'
+            ),
+            "app/dynamic/route.py": (
+                "import importlib\n"
+                "from importlib import import_module\n\n"
+                "def GET():\n"
+                '    b = importlib.import_module("pkg_b")\n'
+                '    c = import_module("pkg_c")\n'
+                '    return {"b": b.describe(), "c": c.describe()}\n'
+            ),
+            "app/dunder/route.py": (
+                "def GET():\n"
+                '    c = __import__("pkg_c")\n'
+                '    return {"c": c.describe()}\n'
+            ),
+            "app/included/route.py": (
+                "import importlib\n\n"
+                'include = ["Pkg_D"]\n\n'
+                "def GET():\n"
+                '    mod = importlib.import_module("".join(["pkg", "_d"]))\n'
+                '    return {"d": mod.describe()}\n'
+            ),
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=workspace, check=True)
+
+    for dist_name in ("pkg-trans", "pkg-a", "pkg-b", "pkg-c", "pkg-d"):
+        monkeypatch.syspath_prepend(str(workspace / "packages" / dist_name / "src"))
+
+    api = workspace / "apps" / "api"
+    plan = plan_build(api, platform=None, output=tmp_path / "out-shaken")
+    by_name = {spec.name: spec for spec in plan.functions}
+    assert by_name["alpha"].trace_roots == (
+        (api / "app" / "alpha" / "route.py").resolve(),
+    )
+    assert by_name["alpha"].include == ()
+    assert by_name["included"].include == ("pkg-d",)
+
+    shaken = build(api, platform=None, output=tmp_path / "out-shaken")
+    report_out = capsys.readouterr().out
+
+    def dists_for(out_dir: Path, func_name: str) -> set[str]:
+        return set(
+            index_store(
+                out_dir / "functions" / f"{func_name}.func" / "_vendor"
+            ).distributions
+        )
+
+    always = {"haumea", "msgspec", "vercel-runtime"}
+
+    alpha_dists = dists_for(shaken, "alpha")
+    beta_dists = dists_for(shaken, "beta")
+    dynamic_dists = dists_for(shaken, "dynamic")
+    dunder_dists = dists_for(shaken, "dunder")
+    included_dists = dists_for(shaken, "included")
+
+    assert always | {"pkg-a", "pkg-trans"} <= alpha_dists
+    assert not ({"pkg-b", "pkg-c", "pkg-d"} & alpha_dists)
+
+    assert always | {"pkg-b"} <= beta_dists
+    assert not ({"pkg-a", "pkg-trans", "pkg-c", "pkg-d"} & beta_dists)
+
+    assert always | {"pkg-b", "pkg-c"} <= dynamic_dists
+    assert not ({"pkg-a", "pkg-trans", "pkg-d"} & dynamic_dists)
+
+    assert always | {"pkg-c"} <= dunder_dists
+    assert not ({"pkg-a", "pkg-trans", "pkg-b", "pkg-d"} & dunder_dists)
+
+    assert always | {"pkg-d"} <= included_dists
+    assert not ({"pkg-a", "pkg-trans", "pkg-b", "pkg-c"} & included_dists)
+
+    # Size report reflects each function's actual bundled distribution count.
+    for func_name, expected_dists in (
+        ("alpha", alpha_dists),
+        ("beta", beta_dists),
+        ("dynamic", dynamic_dists),
+        ("dunder", dunder_dists),
+        ("included", included_dists),
+    ):
+        line = next(
+            row for row in report_out.splitlines() if row.strip().startswith(func_name)
+        )
+        assert f"({len(expected_dists)} distributions)" in line
+
+    # Shared files across functions are still hard-linked.
+    alpha_haumea = (
+        shaken / "functions" / "alpha.func" / "_vendor" / "haumea" / "__init__.py"
+    )
+    beta_haumea = (
+        shaken / "functions" / "beta.func" / "_vendor" / "haumea" / "__init__.py"
+    )
+    assert alpha_haumea.stat().st_ino == beta_haumea.stat().st_ino
+
+    # Every tree-shaken function executes standalone via vc_handler (python -S).
+    assert json.loads(invoke(shaken, "alpha", "/alpha")["body"]) == {
+        "result": "pkg-a+from-trans:ok"
+    }
+    assert json.loads(invoke(shaken, "beta", "/beta")["body"]) == {"result": "pkg-b"}
+    assert json.loads(invoke(shaken, "dynamic", "/dynamic")["body"]) == {
+        "b": "pkg-b",
+        "c": "pkg-c",
+    }
+    assert json.loads(invoke(shaken, "dunder", "/dunder")["body"]) == {"c": "pkg-c"}
+    assert json.loads(invoke(shaken, "included", "/included")["body"]) == {"d": "pkg-d"}
+
+    # Project-level `include` adds its normalized distribution to every function.
+    (api / "pyproject.toml").write_text(
+        base_pyproject + '\n[tool.haumea]\ninclude = ["Pkg_D"]\n'
+    )
+    with_proj_inc = build(api, platform=None, output=tmp_path / "out-proj-inc")
+    capsys.readouterr()
+    beta_with_inc = dists_for(with_proj_inc, "beta")
+    assert always | {"pkg-b", "pkg-d"} <= beta_with_inc
+    assert not ({"pkg-a", "pkg-trans", "pkg-c"} & beta_with_inc)
+    assert json.loads(invoke(with_proj_inc, "beta", "/beta")["body"]) == {
+        "result": "pkg-b"
+    }
+
+    # `tree_shake = false` restores the full store into every function.
+    (api / "pyproject.toml").write_text(
+        base_pyproject + "\n[tool.haumea]\ntree_shake = false\n"
+    )
+    full = build(api, platform=None, output=tmp_path / "out-full")
+    full_report = capsys.readouterr().out
+    all_expected = always | {"pkg-a", "pkg-trans", "pkg-b", "pkg-c", "pkg-d"}
+    for func_name in ("alpha", "beta", "dynamic", "dunder", "included"):
+        func_dists = dists_for(full, func_name)
+        assert all_expected <= func_dists
+        line = next(
+            row for row in full_report.splitlines() if row.strip().startswith(func_name)
+        )
+        assert f"({len(func_dists)} distributions)" in line
+    assert json.loads(invoke(full, "alpha", "/alpha")["body"]) == {
+        "result": "pkg-a+from-trans:ok"
+    }
+    assert json.loads(invoke(full, "beta", "/beta")["body"]) == {"result": "pkg-b"}
+
+
+# @lat: [[tests#Import tracer and closure]]
+def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, capsys):
+    from haumea.build import index_store
+
+    def make_dist(
+        name: str,
+        module: str,
+        *,
+        requires: list[str] | None = None,
+        extra_files: dict[str, str] | None = None,
+        top_level: str | None = None,
+    ) -> dict[str, str]:
+        dist_info = f"{name.replace('-', '_')}-1.0.dist-info"
+        meta_lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 1.0"]
+        for req in requires or ():
+            meta_lines.append(f"Requires-Dist: {req}")
+        files: dict[str, str] = {
+            f"{module}/__init__.py": f"NAME = {name!r}\n",
+            **(extra_files or {}),
+        }
+        record_lines = [f"{path},," for path in sorted(files)]
+        record_lines.append(f"{dist_info}/METADATA,,")
+        record_lines.append(f"{dist_info}/RECORD,,")
+        files[f"{dist_info}/METADATA"] = "\n".join(meta_lines) + "\n"
+        if top_level is not None:
+            files[f"{dist_info}/top_level.txt"] = top_level
+            record_lines.append(f"{dist_info}/top_level.txt,,")
+        files[f"{dist_info}/RECORD"] = "\n".join(record_lines) + "\n"
+        return files
+
+    store_files: dict[str, str] = {}
+    for dist in (
+        make_dist("haumea", "haumea", requires=["msgspec>=0.20"]),
+        make_dist("msgspec", "msgspec"),
+        make_dist("vercel-runtime", "vercel_runtime"),
+        make_dist("vercel-functions", "vercel_functions", requires=["vf-dep"]),
+        make_dist("vf-dep", "vf_dep"),
+        make_dist("cyc-a", "cyc_a", requires=["cyc-b"]),
+        make_dist("cyc-b", "cyc_b", requires=["cyc-a"]),
+        make_dist("ns-one", "ns_one", top_level="ns_shared\n"),
+        make_dist("ns-two", "ns_two", top_level="ns_shared\n"),
+        make_dist("else-pkg", "else_pkg"),
+        make_dist("not-tc-pkg", "not_tc_pkg"),
+        make_dist("tc-only", "tc_only"),
+        make_dist("rel-pkg", "rel_pkg"),
+        make_dist("init-pkg", "init_pkg"),
+        make_dist("alias-pkg", "alias_pkg"),
+        make_dist(
+            "huge-pkg",
+            "huge_pkg",
+            extra_files={"huge_pkg/weights.bin": "x" * 16_384},
+        ),
+    ):
+        store_files.update(dist)
+
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_project(vendor_dir, store_files)
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+
+    project = tmp_path / "edge"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "edge"\nversion = "0"\n',
+            # Namespace-package project helper directory (no __init__.py).
+            "ns_helpers/sub.py": (
+                "def use():\n    import rel_pkg\n    return rel_pkg\n"
+            ),
+            # Package whose __init__.py itself imports init_pkg.
+            "pkg_helpers/__init__.py": (
+                "def init_use():\n    import init_pkg\n    return init_pkg\n"
+            ),
+            "pkg_helpers/mod.py": (
+                "def use():\n"
+                "    import importlib as il\n"
+                "    from importlib import import_module as im\n"
+                '    il.import_module(name="alias_pkg")\n'
+                '    im(".leaf", __package__)\n'
+            ),
+            "pkg_helpers/leaf.py": ("def use():\n    import cyc_a\n    return cyc_a\n"),
+            "pkg_helpers/shared.py": (
+                "def use():\n    import ns_shared\n    return ns_shared\n"
+            ),
+            "pkg_helpers/sub/__init__.py": "",
+            "pkg_helpers/sub/deep.py": (
+                "from ..shared import use as shared_use\n\n"
+                "def run():\n    return shared_use()\n"
+            ),
+            "app/traced/route.py": (
+                "import os\n"
+                "from typing import TYPE_CHECKING\n"
+                "from ns_helpers import sub\n"
+                "from pkg_helpers.mod import use\n"
+                "from pkg_helpers.sub.deep import run\n\n"
+                "if TYPE_CHECKING:\n"
+                "    import tc_only\n"
+                "else:\n"
+                "    def runtime_else():\n"
+                "        import else_pkg\n"
+                "        return else_pkg\n\n"
+                "if not TYPE_CHECKING:\n"
+                "    def runtime_not_tc():\n"
+                "        import not_tc_pkg\n"
+                "        return not_tc_pkg\n"
+                "else:\n"
+                "    import tc_only\n\n"
+                "if TYPE_CHECKING and True:\n"
+                "    import tc_only\n\n"
+                "def GET():\n"
+                "    if False:\n"
+                "        import unknown_not_in_store\n"
+                '    return {"ok": True}\n'
+            ),
+            "app/heavy/route.py": (
+                'def GET():\n    import huge_pkg\n    return {"ok": True}\n'
+            ),
+            "app/tiny/route.py": ("def GET():\n    return {'ok': True}\n"),
+        },
+    )
+
+    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 8_192)
+    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
+    with pytest.warns(UserWarning) as record:
+        out = build(project, platform=None, output=tmp_path / "out")
+    capsys.readouterr()
+
+    # Only `heavy` exceeds SIZE_WARN_BYTES; `tiny` and `traced` stay below it.
+    warn_messages = [str(item.message) for item in record]
+    assert len(warn_messages) == 1
+    assert "'heavy'" in warn_messages[0]
+    assert "huge-pkg" in warn_messages[0]
+
+    always_with_vf = {
+        "haumea",
+        "msgspec",
+        "vercel-runtime",
+        "vercel-functions",
+        "vf-dep",
+    }
+
+    traced_dists = set(
+        index_store(out / "functions" / "traced.func" / "_vendor").distributions
+    )
+    assert traced_dists == always_with_vf | {
+        "rel-pkg",
+        "init-pkg",
+        "alias-pkg",
+        "cyc-a",
+        "cyc-b",
+        "ns-one",
+        "ns-two",
+        "else-pkg",
+        "not-tc-pkg",
+    }
+    assert "tc-only" not in traced_dists
+    assert "huge-pkg" not in traced_dists
+
+    tiny_dists = set(
+        index_store(out / "functions" / "tiny.func" / "_vendor").distributions
+    )
+    assert tiny_dists == always_with_vf
+
+    heavy_dists = set(
+        index_store(out / "functions" / "heavy.func" / "_vendor").distributions
+    )
+    assert heavy_dists == always_with_vf | {"huge-pkg"}
+
+    # Invalid route-level `include` raises ValueError during plan_build.
+    for i, bad_include in enumerate(
+        ('include = "pkg-a"\n', "include = [123]\n", 'include = [""]\n')
+    ):
+        bad_proj = tmp_path / f"bad-{i}"
+        write_project(
+            bad_proj,
+            {
+                "pyproject.toml": '[project]\nname = "bad"\nversion = "0"\n',
+                "app/route.py": bad_include + "def GET():\n    return {}\n",
+            },
+        )
+        with pytest.raises(ValueError, match="include"):
+            plan_build(bad_proj)

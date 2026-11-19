@@ -7,7 +7,8 @@ Project-level settings live in `[tool.haumea]` in the project's `pyproject.toml`
 [[src/haumea/config.py#load_config]] parses `pyproject.toml` with `tomllib` and converts `[tool.haumea]` into the frozen [[src/haumea/config.py#HaumeaConfig]] `msgspec.Struct`.
 
 - `base_path: str = ""` — URL prefix for every route, doc and static file ([[config#Base Path]]).
-- `tree_shake: bool = True` and `include: tuple[str, ...] = ()` — parsed and stored on the build plan, but not used by the build yet.
+- `tree_shake: bool = True` — bundle only the distributions each function traces plus always-included sets, or link the whole store when `False` ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]).
+- `include: tuple[str, ...] = ()` — distribution names bundled (with their closures) into every function alongside route-level `include` ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]).
 
 A missing table gives the defaults. A non-table `tool` or `tool.haumea`, unknown keys (`forbid_unknown_fields`), wrong types (strict: `tree_shake = 1`, `include = "anyio"` and `include = [1]` all fail) and invalid prefixes raise `ValueError` naming the file. Route-level settings stay in `route.py` ([[build#Per-Route Function Config]]).
 
