@@ -110,9 +110,9 @@ Verify repeated builds of the same project into separate directories produce byt
 
 ## Workspace discovery
 
-Verify [[src/haumea/build.py#plan_build]] discovers the nearest ancestor declaring `[tool.uv.workspace]` alongside `uv.lock`, sets `package` from `[project].name` in workspaces (`None` outside), and rejects unnamed workspace projects.
+Verify [[src/haumea/build.py#plan_build]] finds the nearest `[tool.uv.workspace]` with `uv.lock`, stops at standalone `uv.lock` boundaries, sets `package` from `[project].name` in workspaces (`None` outside), and rejects unnamed workspace projects.
 
-Covers ancestors missing `uv.lock` or `[tool.uv.workspace]`, nested workspaces where the nearest match wins, a non-virtual workspace root acting as a service, and `ValueError` rejection for unnamed workspace members or virtual roots.
+Covers ancestors missing `uv.lock` or `[tool.uv.workspace]`, standalone projects or ancestors with their own `uv.lock` under a workspace root, nested workspaces where the nearest match wins, a non-virtual workspace root acting as a service, and `ValueError` rejection for unnamed workspace members or virtual roots.
 
 ## Workspace build
 

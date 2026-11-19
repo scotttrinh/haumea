@@ -111,10 +111,14 @@ def _is_uv_workspace(directory: Path) -> bool:
 
 def _find_workspace_root(project_dir: Path) -> Path | None:
     """Nearest directory from ``project_dir`` upward declaring
-    ``[tool.uv.workspace]`` alongside ``uv.lock``, or ``None``."""
+    ``[tool.uv.workspace]`` alongside ``uv.lock``, or ``None``.
+
+    Stops walking up at any directory with its own ``uv.lock`` that does not
+    declare ``[tool.uv.workspace]``.
+    """
     for directory in (project_dir, *project_dir.parents):
-        if _is_uv_workspace(directory):
-            return directory
+        if (directory / UV_LOCK).is_file():
+            return directory if _is_uv_workspace(directory) else None
     return None
 
 

@@ -197,7 +197,7 @@ The split keeps tree-shaking, monorepo support and future function kinds (static
 
 Vercel builds each service from its `root`, so `haumea build` runs inside the service directory. The uv workspace root may be above it.
 
-- **Workspace discovery.** The workspace root is the nearest directory, starting at the project dir and walking up, whose `pyproject.toml` declares `[tool.uv.workspace]` and which contains `uv.lock`. If none is found, it is the project dir.
+- **Workspace discovery.** The workspace root is the nearest directory, starting at the project dir and walking up, whose `pyproject.toml` declares `[tool.uv.workspace]` and which contains `uv.lock`. Walking up stops at a directory that has its own `uv.lock` without `[tool.uv.workspace]`, treating the project as standalone (`workspace_root = project_dir`). If none is found, it is the project dir.
 - **Scoped export.** The build runs `uv export --package <project name> --locked --no-dev --no-emit-project --no-editable --no-hashes` from the workspace root. This exports only this service's transitive dependencies.
 - **Install.** The build runs `uv pip install --target <store>` from the workspace root, so relative requirement paths resolve.
 - **Workspace siblings.** With `--no-editable`, a sibling package such as `packages/core` is built and installed as a normal distribution. Tree-shaking (§5) then treats it like any other dependency.

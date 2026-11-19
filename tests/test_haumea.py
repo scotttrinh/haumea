@@ -1042,8 +1042,24 @@ def test_workspace_root_discovery(tmp_path, isolated_imports):
     with pytest.raises(ValueError, match="name"):
         plan_build(unnamed)
 
-    # An ancestor with uv.lock but without [tool.uv.workspace] is not a workspace root.
-    plain_parent = tmp_path / "plain_parent"
+    # A standalone project with its own uv.lock under a workspace root stops
+    # walking up and resolves to itself.
+    standalone = outer / "standalone"
+    write_project(
+        standalone,
+        {
+            "pyproject.toml": '[project]\nname = "standalone"\nversion = "0"\n',
+            "uv.lock": "version = 1\n",
+            "app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    standalone_plan = plan_build(standalone)
+    assert standalone_plan.workspace_root == standalone.resolve()
+    assert standalone_plan.package is None
+
+    # An ancestor with uv.lock but without [tool.uv.workspace] is not a
+    # workspace root and stops walking up before reaching an outer workspace.
+    plain_parent = outer / "plain_parent"
     write_project(
         plain_parent,
         {
