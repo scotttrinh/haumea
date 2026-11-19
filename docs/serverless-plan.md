@@ -124,11 +124,17 @@ Each step should land as its own reviewable change with its tests. When a step c
   - Calling `after()` outside a request raises.
   - The generated entrypoint selects `wait_until`.
 
+### 3.6 Explicit OpenAPI security and response metadata (§6.7)
+
+- Settle the declaration API from §9 question 5 for credential schemes and documented errors. Start with the existing hello `PUT` and an ordinary `Depends` declaration. This step can land independently of Phase 4.
+- Extend endpoint metadata and `openapi.py` to emit a named bearer scheme once, reference it from protected operations, and merge declared responses with existing responses. Preserve schema visibility from 3.4.
+- Verify the emitted static schema matches dev. A protected operation references the scheme without a duplicate credential header, a public sibling has no security requirement, and only explicitly declared authorization errors appear. A dependency that raises if called must still permit schema generation.
+
 ---
 
 ## Phase 4: Segment files
 
-**Goal:** `middleware.py` and `error.py` apply to routes by directory, the same way in dev and in deployed functions.
+**Goal:** middleware, error boundaries, and typed dependencies apply to routes by directory, the same way in dev and in deployed functions.
 
 ### 4.1 `Route.segments` and segment loading (§7.1)
 
@@ -152,6 +158,13 @@ Each step should land as its own reviewable change with its tests. When a step c
 ### 4.4 Segment files as trace roots (§5.2)
 
 - **Tests:** a dependency imported only by `app/admin/middleware.py` is bundled only into functions under `app/admin/`.
+
+### 4.5 Inherited typed dependencies (§7.5)
+
+- Build on ancestor discovery (4.1) and segment tracing (4.4). Settle the declaration spelling from §9 question 4. In `routing.py`, load the applicable declarations for both app factories and register them with each method. Include the declaring files in each affected function's trace roots.
+- Extend `params.py` so checks and handler arguments share one request cache. Have the schema generator traverse those same checks and deduplicate repeated inputs. If 3.6 is available, carry explicit metadata through the same traversal.
+- Test a newly added route under a protected group, a public sibling, and a handler that explicitly requests the inherited callable. Verify root-to-leaf order, rejection before handler execution, one call per request, and one documented input. Exercise both app factories, inspect the built schema, and verify the sibling function omits a package imported only by the check.
+- Once 3.6 and 4.5 have both landed, run the bearer-scheme and declared-error assertions from 3.6 against an inherited check as well. Whichever step lands second owns that integration test.
 
 ---
 

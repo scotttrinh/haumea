@@ -9,9 +9,23 @@ This spec covers four areas, in priority order:
 1. Deploying a Haumea backend beside a frontend (Vercel Services, `base_path`, uv workspaces).
 2. Per-function dependency tree-shaking.
 3. Request and response additions (streaming, cookies, platform metadata, `after()`, `lazy()`).
-4. Directory-scoped `middleware.py` and `error.py`.
+4. Directory-scoped middleware, error handling, and typed dependencies.
 
 Every feature still has to pass the litmus test in [serverless-design.md](serverless-design.md#guiding-principles). It should compile into Build Output or be scoped to the routes that use it, it should not add cold starts, and `haumea dev` should behave like the deployed build.
+
+## Public routing contract
+
+The filesystem declares each HTTP endpoint. For example, `app/items/[id]/route.py` owns `/items/{id}` and exports the methods it serves. Its `GET` and `PUT` share one deployed function. Each handler's typed signature declares its inputs and dependencies. Dev, build, and OpenAPI derive their operations from those same files, subject to schema visibility (§6.4).
+
+App construction and route registration belong to the framework. The target public API excludes manual registration, router mounting, and registration-order overrides. Today the package exports `Haumea` and exposes `add_route`; bringing those exports into line with this contract is an implementation follow-up. A test can exercise discovery and dispatch using a fixture containing ordinary route files.
+
+Common uses of a [FastAPI router](https://fastapi.tiangolo.com/tutorial/bigger-applications/) have the following counterparts:
+
+- **Prefixes and organization.** Nested directories compose URL segments, `(group)` directories organize related routes without adding a segment, and `base_path` mounts the whole service (§2).
+- **Reuse at several URLs.** Two route files can export the same imported handler or call a shared Python function. For example, keeping both a v1 and a v2 URL leaves two discoverable endpoints, each with its own function configuration.
+- **Shared request behavior.** A handler can import a typed dependency such as `current_user` and request its value with `Depends`. The planned segment files (§7) wrap requests or handle exceptions across a subtree, including a URL-transparent group. A segment can also require a typed dependency for all its handlers (§7.5). Explicit OpenAPI security and response metadata have a separate contract (§6.7).
+
+Each endpoint must work on its first invocation in a fresh instance. A warm instance can reuse a client (§6.6). Correctness must survive instance replacement and concurrent requests on different instances. Route discovery and schema generation must work without starting clients, opening connections, or running application startup hooks.
 
 ---
 
@@ -209,7 +223,7 @@ Each function bundles only the distributions it can import. First-party project 
 Each function has these trace roots:
 
 - its `route.py`;
-- its ancestor `middleware.py` and `error.py` files (§7);
+- its ancestor segment files (§7), including the declarations of inherited dependencies;
 - the generated entrypoint, which imports `haumea`.
 
 ### 5.3 Static import tracing
@@ -323,7 +337,7 @@ A module-level `include_in_schema = False` in `route.py` leaves the route's oper
 - **Arguments.** `fn` may be sync or async. Sync callables are wrapped with `asyncio.to_thread`.
 - **When it can be called.** Only while a request is being handled; otherwise it raises `RuntimeError`.
 - **Errors.** Exceptions in the work are logged and never reach the client.
-- **Backends.** `Haumea(after_backend=…)` chooses how the work runs. Only the generated entrypoint opts into the platform backend, so tests and dev always run the work locally.
+- **Backends.** The framework selects the backend when it constructs the app. Only the generated entrypoint opts into the platform backend, so tests and dev always run the work locally.
 
   | Backend | Used by | Behavior |
   | --- | --- | --- |
@@ -341,16 +355,24 @@ A module-level `include_in_schema = False` in `route.py` leaves the route's oper
 - **Async factories.** The first call's task is cached and awaited by later callers.
 - **Use as a dependency.** The callable works directly with `Depends(...)`.
 
+### 6.7 Explicit OpenAPI security and responses
+
+The current generator walks the declared request fields of a handler and its dependencies. For example, the hello project's `PUT` operation currently emits an ordinary `authorization` header and documents `200` and `422`, even though its dependency can raise `401`.
+
+Security documentation needs an explicit declaration of the credential scheme. For a declared HTTP bearer scheme, emit one entry in `components.securitySchemes` and reference it in each affected operation's `security` list. Represent its credential there only. OpenAPI reserves the `Authorization` header for this purpose. Document `401` and `403` when explicitly declared. A bearer scheme describes how to present credentials. Application code still decides whether the caller may perform the operation.
+
+This feature applies to ordinary handler dependencies independently of inheritance. Schema generation reads declarations without executing checks or inspecting function bodies for exceptions. The Python spelling of these declarations remains open (§9).
+
 ---
 
-## 7. Segment files: `middleware.py` and `error.py`
+## 7. Segment files
 
-Both files apply to the routes in their directory and below. Each route composes only the files on its own ancestor path.
+Segment files apply to the routes in their directory and below. Each route composes only the files on its own ancestor path.
 
 ### 7.1 Discovery
 
 - **Segments.** `Route` gains `segments`: the directories from `app/` down to the route's own directory, inclusive. Route groups count as segments.
-- **Loading.** Segment files load once per process and are shared by every route under them.
+- **Loading.** Each deployed function loads only its ancestor segment files, once per instance. Dev can reuse the same module for several routes in one process. Segment code must work when those routes run in separate instances.
 
 ### 7.2 `middleware.py`
 
@@ -372,13 +394,21 @@ Each request runs through these layers, outermost first:
 
 1. middleware chain (root to leaf);
 2. error boundary;
-3. dependencies and handler.
+3. inherited dependencies, then handler arguments and the handler (§7.5).
 
 - **Middleware sees a response.** Handler and dependency errors have already become a `Response` by the time middleware inspects it.
 - **Middleware errors.** An exception raised by middleware itself skips `error.py` and gets the default mapping.
 - **Unmatched paths.** The layers run only after a path matches. A path with no route never reaches a deployed function, so in dev it returns Haumea's JSON 404 without running any segment file. The deployed response is Vercel's `NOT_FOUND` page instead (§2.2, dev parity).
 - **405s.** A 405 runs through the matched route's chain, as it does in production.
 - **Parity.** `create_app` and `create_route_app` build the same per-route chain.
+
+### 7.5 Inherited typed dependencies
+
+A segment declares an ordered collection of dependency callables. For example, an admin directory can require `require_admin` for every exported method beneath it. A new route inherits the check by placement, including through URL-transparent groups. The declaration syntax is an implementation-plan decision (§9).
+
+Both app factories attach ancestor checks to each matching method's `Endpoint` during registration. On dispatch, resolve them from root to leaf using the same request cache as `Depends`. A failed check prevents the handler from running. A handler that needs the result can request the same callable with `Depends` and receive its cached value. Checks run inside the selected function. A 404 or method mismatch has no selected handler and runs no typed check.
+
+The existing build-time app construction can inspect these same dependency signatures. Include their declared request inputs once per operation, even if a handler also requests the dependency. Reading a raw `Request` exposes no fields to introspection. Neither discovery nor schema generation invokes the checks. Formal security requirements and error responses follow the explicit metadata rules in §6.7. Inheritance adds no build stage.
 
 ---
 
@@ -407,3 +437,5 @@ These items stay in [serverless-design.md](serverless-design.md):
    - **Follow-up.** The `"vite"` framework slug is a workaround. Ask Vercel whether `services` will get a builder-neutral way to declare a prebuilt Build Output service.
 2. **`uv export --package` in a workspace.** Does `--no-emit-project` combined with `--package` drop exactly the selected package? A workspace fixture in Phase 1 checks this.
 3. **`vercel-functions` import path.** Does the split package keep the `vercel.functions` import path? Check when it is published.
+4. **Segment dependency declaration.** Choose the segment filename and exported collection for §7.5 before implementing plan step 4.5. Keep route authorship in `route.py`.
+5. **Operation metadata.** Choose how a dependency declares a credential scheme and how an operation or dependency declares documented responses (§6.7). Broader defaults such as subtree tags and method-specific success responses remain open.
