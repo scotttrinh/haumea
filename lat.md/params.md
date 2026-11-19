@@ -38,3 +38,17 @@ All conversion and decoding failures are collected into a list of `{"loc": [...]
 [[src/haumea/requests.py#Request#cookies]] parses every `cookie` request header into a `dict[str, str]`, which `Cookie()` parameters read from.
 
 Each `;`-separated pair splits on its first `=`, so values may contain `=`; names and values are stripped, and pairs without `=` or a name are skipped. [[src/haumea/requests.py#_unquote]] reverses `http.cookies` quoting (surrounding quotes, backslash and `\ooo` octal escapes), so values written by [[src/haumea/responses.py#Response#set_cookie]] round-trip. When a name repeats the first value wins, since browsers send the most specific path first.
+
+## Platform Metadata
+
+[[src/haumea/requests.py#Request]] exposes Vercel's per-request metadata as `id`, `ip` and `geo`, each with a local fallback so handlers run unchanged in dev and tests.
+
+- [[src/haumea/requests.py#Request#id]] is `x-vercel-id`, else a UUID4 hex string generated when the `Request` is constructed, so repeated and concurrent reads from several threads agree.
+- [[src/haumea/requests.py#Request#ip]] is `x-real-ip`, else the first trimmed `x-forwarded-for` entry, else the host of `scope["client"]`, or `None` without a client.
+
+[[src/haumea/requests.py#Request#_first_header]] reads `x-vercel-id`, `x-real-ip` and `x-forwarded-for` in `scope["headers"]` order. `Request.headers` keeps the last of repeated field lines, which would pick a proxy-appended `x-forwarded-for` line over the client's.
+- [[src/haumea/requests.py#Request#geo]] returns a frozen [[src/haumea/requests.py#Geo]] from the `x-vercel-ip-*` headers; fields are `None` when their header is absent.
+
+`Geo.region` reads `x-vercel-ip-country-region`, Vercel's ISO 3166-2 region code (`countryRegion` in `@vercel/functions`); there is no `x-vercel-ip-region` header, and the edge region lives in `x-vercel-id`. Vercel percent-encodes non-ASCII city names (RFC 3986), so `city` is decoded with `urllib.parse.unquote`.
+
+Vercel sets these headers at the edge, but outside Vercel they come straight from the client, so they must not be trusted for authorization.

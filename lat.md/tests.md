@@ -227,3 +227,27 @@ Verify `set_cookie` rejects non-Latin-1 values, non-ASCII `path`/`domain`/`expir
 ## Cookie round trip
 
 Verify cookies set through an app, including empty values and ones with spaces, `=`, quotes, backslashes, `;`, `,` and Latin-1 text, come back intact through `Cookie()` and `request.cookies` when sent back.
+
+## Platform metadata from Vercel headers
+
+Verify `request.id`, `request.ip` and `request.geo` read `x-vercel-id`, `x-real-ip` and every `x-vercel-ip-*` field, percent-decoding `city` (including non-ASCII), and that `Geo` is exported from `haumea` and `haumea.requests`.
+
+## Platform client IP sources
+
+Verify [[src/haumea/requests.py#Request#ip]] prefers `x-real-ip`, then the first trimmed `x-forwarded-for` entry over the ASGI client, then the client host, and is `None` when `client` is missing or empty.
+
+## Platform metadata dev fallbacks
+
+Verify that without Vercel headers `request.id` is a UUID4 hex string, stable on one request and distinct across requests, `ip` is the client host, and `geo` is an all-`None` `Geo`.
+
+## Platform metadata through create_app
+
+Verify a `route.py` handler taking `Request` sees Vercel header metadata through `create_app`, and without the headers gets distinct generated ids, the ASGI client host and an all-`None` geo.
+
+## Platform client IP from repeated forwarded headers
+
+Verify that with two raw `x-forwarded-for` header tuples [[src/haumea/requests.py#Request#ip]] returns the first entry of the first line, while `request.headers` still keeps the last value.
+
+## Platform request id under concurrent reads
+
+Verify that threads released together by a barrier all read the same generated `request.id` from one `Request`, repeated over many requests to expose races.

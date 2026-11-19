@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
+
+import msgspec
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -24,6 +27,22 @@ def _unquote(value: str) -> str:
     )
 
 
+class Geo(msgspec.Struct, frozen=True):
+    """Requester location from Vercel's ``x-vercel-ip-*`` headers.
+
+    ``region`` is the ISO 3166-2 region from ``x-vercel-ip-country-region``
+    (``@vercel/functions`` calls it ``countryRegion``), not the Vercel edge
+    region. Every field is ``None`` when its header is absent, as in dev.
+    """
+
+    country: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: str | None = None
+    longitude: str | None = None
+    postal_code: str | None = None
+
+
 class Request:
     """An incoming HTTP request, wrapping the ASGI scope."""
 
@@ -32,6 +51,8 @@ class Request:
         self._receive = receive
         self._body: bytes | None = None
         self.path_params: dict[str, str] = {}
+        # Generated eagerly so concurrent first reads of ``id`` agree.
+        self._generated_id = uuid.uuid4().hex
 
     @property
     def method(self) -> str:
@@ -77,6 +98,54 @@ class Request:
                 if sep and name and name not in cookies:
                     cookies[name] = _unquote(raw.strip())
         return cookies
+
+    def _first_header(self, name: bytes) -> str | None:
+        """The first ``name`` header in ``scope["headers"]`` order.
+
+        ``headers`` keeps the last of repeated field lines; platform metadata
+        needs the first.
+        """
+        for key, value in self.scope.get("headers", []):
+            if key.lower() == name:
+                return value.decode("latin-1")
+        return None
+
+    @property
+    def id(self) -> str:
+        """The ``x-vercel-id`` header, else a UUID4 hex string generated once
+        per request."""
+        return self._first_header(b"x-vercel-id") or self._generated_id
+
+    @property
+    def ip(self) -> str | None:
+        """The client IP: ``x-real-ip``, else the first ``x-forwarded-for``
+        entry, else the ASGI ``client`` host.
+
+        Outside Vercel the headers come from the client, so never trust them
+        for authorization.
+        """
+        if real_ip := (self._first_header(b"x-real-ip") or "").strip():
+            return real_ip
+        forwarded = self._first_header(b"x-forwarded-for") or ""
+        if first := forwarded.split(",")[0].strip():
+            return first
+        client = self.scope.get("client")
+        return client[0] if client else None
+
+    @property
+    def geo(self) -> Geo:
+        """Requester location from the ``x-vercel-ip-*`` headers; the city is
+        percent-decoded."""
+        headers = self.headers
+        city = headers.get("x-vercel-ip-city")
+        return Geo(
+            country=headers.get("x-vercel-ip-country"),
+            region=headers.get("x-vercel-ip-country-region"),
+            city=None if city is None else unquote(city),
+            latitude=headers.get("x-vercel-ip-latitude"),
+            longitude=headers.get("x-vercel-ip-longitude"),
+            postal_code=headers.get("x-vercel-ip-postal-code"),
+        )
 
     @property
     def query_params(self) -> dict[str, list[str]]:
