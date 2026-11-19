@@ -84,7 +84,9 @@ OpenAPI schema and Swagger UI are rendered at build time and served as static
 files at `/openapi.json` and `/docs`, straight from the CDN.
 
 Dependencies are resolved from the project's `pyproject.toml` with `uv` and
-vendored into every function; `public/` is served as static files. See
+vendored into every function; `public/` is served as static files. Add
+`haumea[dev]` to `[dependency-groups].dev` for `haumea dev` so `uvicorn` is
+available locally without being vendored into built functions. See
 [`examples/hello`](examples/hello).
 
 ## Development

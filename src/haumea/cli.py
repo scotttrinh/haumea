@@ -41,7 +41,14 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "dev":
-        import uvicorn
+        try:
+            import uvicorn
+        except ModuleNotFoundError as exc:
+            if exc.name != "uvicorn":
+                raise
+            raise SystemExit(
+                "haumea dev requires uvicorn; install haumea[dev]"
+            ) from None
 
         sys.path.insert(0, os.getcwd())
         # base_path lives in pyproject.toml. Only the watchfiles reloader

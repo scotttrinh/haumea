@@ -78,7 +78,7 @@ Checks mutable `regions` isolation, mixed dict keys, and values whose `__deepcop
 
 ## Build output layout
 
-Verify `.vercel/output` `config.json` rewrites, static `docs.html`/`openapi.json`/`public/` files, per-route `.func` directories, `.vc-config.json` `maxDuration` overrides, and `_vendor` contents.
+Verify `.vercel/output` `config.json` rewrites, static `docs.html`/`openapi.json`/`public/` files, per-route `.func` directories, `.vc-config.json` `maxDuration` overrides, and `_vendor` contents (including omitting `pydantic` and `uvicorn`).
 
 ## Built function invocation
 
@@ -120,4 +120,8 @@ Verify [[src/haumea/build.py#build]] on a uv workspace with `apps/api`, `package
 
 ## Full-stack example build
 
-Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.12 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions, and invokes each built function standalone.
+Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.12 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions without `uvicorn` in `_vendor/`, and invokes each built function standalone.
+
+## Dev requires uvicorn
+
+Verify [[src/haumea/cli.py#main]] exits with a `SystemExit` message pointing to `haumea[dev]` when `haumea dev` cannot import `uvicorn`.

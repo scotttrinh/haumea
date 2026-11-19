@@ -16,5 +16,6 @@ Haumea intentionally replaces general-purpose ASGI/validation stacks with a mini
 - **msgspec over Pydantic**: Request body decoding, parameter conversion, JSON serialization ([[src/haumea/responses.py#JSONResponse]]), and OpenAPI 3.1 schema generation ([[src/haumea/openapi.py#openapi_schema]]) all use `msgspec` for single-pass validation without Pydantic.
 - **Config without imports**: `[tool.haumea]` is parsed with `tomllib` before any route loads; its `base_path` prefixes every URL in dev and in the build ([[config]]).
 - **Static API docs**: [[src/haumea/build.py#_plan_static]] renders `/openapi.json` and `/docs` (`docs.html`) at build time so deployed functions carry zero docs overhead.
+- **Optional dev server (`haumea[dev]`)**: `uvicorn` lives in `[project.optional-dependencies].dev` ([[pyproject.toml]]) rather than runtime dependencies because deployed functions run on `vercel-runtime`. Apps add `haumea[dev]` to `[dependency-groups].dev`; [[src/haumea/cli.py#main]] exits with a `haumea[dev]` install message if `uvicorn` is missing when running `haumea dev`.
 
 *Note on inferred intent*: The commit history confirms the framework migrated from FastAPI/Pydantic to a custom ASGI + `msgspec` core, but specific cold-start/size benchmarks or plans for non-Vercel deployment targets are not documented in the repository.

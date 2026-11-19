@@ -4,6 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = ["haumea"]
 
+[dependency-groups]
+dev = ["haumea[dev]"]
+
 [tool.uv]
 exclude-newer = "2 days"
 package = false

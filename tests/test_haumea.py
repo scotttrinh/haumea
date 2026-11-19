@@ -351,6 +351,7 @@ def test_build_output_layout(output):
     assert (func / "_vendor" / "haumea").is_dir()
     assert (func / "_vendor" / "msgspec").is_dir()
     assert not (func / "_vendor" / "pydantic").exists()
+    assert not any(p.name.startswith("uvicorn") for p in (func / "_vendor").iterdir())
     assert not (func / "public").exists()
 
     hello_config = (functions / "api" / "hello.func" / ".vc-config.json").read_text()
@@ -1228,7 +1229,11 @@ def test_fullstack_example_build(tmp_path, isolated_imports):
     )
 
     for func in ("api", "api/hello", "api/items/[item_id]"):
-        assert (output / "functions" / f"{func}.func" / ".vc-config.json").is_file()
+        func_dir = output / "functions" / f"{func}.func"
+        assert (func_dir / ".vc-config.json").is_file()
+        assert not any(
+            p.name.startswith("uvicorn") for p in (func_dir / "_vendor").iterdir()
+        )
 
     root_res = invoke(output, "api", "/api")
     assert root_res["statusCode"] == 200
@@ -1244,3 +1249,13 @@ def test_fullstack_example_build(tmp_path, isolated_imports):
     item_res = invoke(output, "api/items/[item_id]", "/api/items/42")
     assert item_res["statusCode"] == 200
     assert json.loads(item_res["body"]) == {"item_id": 42}
+
+
+# @lat: [[tests#Dev requires uvicorn]]
+def test_dev_requires_uvicorn(monkeypatch):
+    monkeypatch.setitem(sys.modules, "uvicorn", None)
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(["dev"])
+    message = str(exc_info.value)
+    assert "uvicorn" in message
+    assert "haumea[dev]" in message

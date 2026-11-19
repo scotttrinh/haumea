@@ -10,10 +10,12 @@ a uv workspace.
 - `pyproject.toml`, `uv.lock`, `.python-version` — uv workspace root pinned to
   Python 3.12 (matching the `python3.12` Vercel function runtime; `uv run` in a
   workspace reads `.python-version` here).
-- `backend/` — Haumea service with `base_path = "/api"`, a backup
-  `backend/.python-version` (`3.12`) for standalone commands inside `backend/`,
-  and routes under `app/` (`/api`, `/api/hello`, `/api/items/{item_id}`,
-  `/api/docs`, `/api/openapi.json`, `/api/hello.txt`).
+- `backend/` — Haumea service with `base_path = "/api"`, `haumea[dev]` in
+  `[dependency-groups].dev` (so `haumea dev` has `uvicorn` without vendoring
+  it into built functions), a backup `backend/.python-version` (`3.12`) for
+  standalone commands inside `backend/`, and routes under `app/` (`/api`,
+  `/api/hello`, `/api/items/{item_id}`, `/api/docs`, `/api/openapi.json`,
+  `/api/hello.txt`).
 - `frontend/` — minimal Next.js App Router app serving `/`.
 
 ## Local development

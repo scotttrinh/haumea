@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "msgspec>=0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
     "uvicorn>=0.30",
 ]
 
@@ -14,6 +18,7 @@ haumea = "haumea.cli:main"
 
 [dependency-groups]
 dev = [
+    "haumea[dev]",
     "httpx>=0.27",
     "pytest>=8",
     "ruff>=0.17.5",
