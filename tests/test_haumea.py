@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import httpx
@@ -1259,3 +1260,226 @@ def test_dev_requires_uvicorn(monkeypatch):
     message = str(exc_info.value)
     assert "uvicorn" in message
     assert "haumea[dev]" in message
+
+
+# @lat: [[tests#Store index]]
+def test_store_index(tmp_path, output):
+    from haumea.build import index_store, normalize_dist_name
+
+    assert normalize_dist_name("My_Cool.Pkg--Name") == "my-cool-pkg-name"
+    assert normalize_dist_name("msgspec") == "msgspec"
+
+    # Missing store directory returns an empty index.
+    empty = index_store(tmp_path / "missing")
+    assert empty.distributions == {}
+    assert empty.by_import == {}
+
+    # Synthetic store covering RECORD, top_level.txt, Requires-Dist, namespace
+    # packages, single-file modules, excluded directories, and escaped paths.
+    store = tmp_path / "_vendor"
+    write_project(
+        store,
+        {
+            "Alpha_Pkg-1.0.dist-info/METADATA": (
+                "Metadata-Version: 2.1\n"
+                "Name: Alpha_Pkg\n"
+                "Version: 1.0\n"
+                "Requires-Dist: Beta.Lib[extra1, extra2]>=2.0,<3; "
+                "python_version >= '3.12'\n"
+                "Requires-Dist: Gamma_Tool (==1.5)\n"
+                "Requires-Dist: delta-dep @ https://example.com/delta.whl ; "
+                "extra == 'dev'\n"
+                "Requires-Dist: z\n"
+            ),
+            "Alpha_Pkg-1.0.dist-info/RECORD": (
+                "alpha/__init__.py,sha256=abc,10\n"
+                "alpha/sub.py,sha256=def,20\n"
+                "alpha_helper.py,sha256=ghi,15\n"
+                "ns_shared/alpha_part.py,sha256=jkl,5\n"
+                "bin/alpha-cli,sha256=mno,30\n"
+                "Alpha_Pkg-1.0.dist-info/METADATA,sha256=pqr,100\n"
+                "Alpha_Pkg-1.0.dist-info/RECORD,,\n"
+                "Alpha_Pkg-1.0.data/purelib/ignored.py,sha256=stu,10\n"
+                "__pycache__/alpha_helper.cpython-312.pyc,sha256=vwx,10\n"
+                "../../outside.py,sha256=yz,10\n"
+                "/abs/outside.py,sha256=ab,10\n"
+                '"alpha/data,file.txt",sha256=cd,4\n'
+            ),
+            "Alpha_Pkg-1.0.dist-info/top_level.txt": "\nalpha_extra\nns_top/sub\n",
+            "alpha/__init__.py": "x = 1\n",
+            "alpha/sub.py": "y = 2\n",
+            "alpha/data,file.txt": "1234",
+            "alpha_helper.py": "z = 3\n",
+            "ns_shared/alpha_part.py": "a = 1\n",
+            "bin/alpha-cli": "#!/usr/bin/env python\n",
+            "Beta.Lib-2.0.dist-info/METADATA": (
+                "Metadata-Version: 2.1\nName: Beta.Lib\nVersion: 2.0\n"
+            ),
+            "Beta.Lib-2.0.dist-info/RECORD": (
+                "ns_shared/beta_part.py,sha256=aaa,8\n"
+                "beta_ext.cpython-312-linux.so,sha256=bbb,12\n"
+                "Beta.Lib-2.0.dist-info/METADATA,sha256=ccc,50\n"
+                "Beta.Lib-2.0.dist-info/RECORD,,\n"
+            ),
+            "ns_shared/beta_part.py": "b = 2\n",
+            "beta_ext.cpython-312-linux.so": "0123456789ab",
+        },
+    )
+
+    index = index_store(store)
+    assert set(index.distributions) == {"alpha-pkg", "beta-lib"}
+
+    alpha = index.distributions["alpha-pkg"]
+    assert alpha.name == "alpha-pkg"
+    assert alpha.dist_info == "Alpha_Pkg-1.0.dist-info"
+    assert alpha.requires == frozenset({"beta-lib", "gamma-tool", "delta-dep", "z"})
+    assert alpha.top_level == frozenset(
+        {"alpha", "alpha_helper", "ns_shared", "alpha_extra", "ns_top"}
+    )
+    assert "alpha/__init__.py" in alpha.files
+    assert "alpha/data,file.txt" in alpha.files
+    assert "bin/alpha-cli" in alpha.files
+    assert "../../outside.py" not in alpha.files
+    assert "/abs/outside.py" not in alpha.files
+    expected_alpha_size = sum(
+        (store / p).lstat().st_size
+        for p in (
+            "alpha/__init__.py",
+            "alpha/sub.py",
+            "alpha/data,file.txt",
+            "alpha_helper.py",
+            "ns_shared/alpha_part.py",
+            "bin/alpha-cli",
+            "Alpha_Pkg-1.0.dist-info/METADATA",
+            "Alpha_Pkg-1.0.dist-info/RECORD",
+            "Alpha_Pkg-1.0.dist-info/top_level.txt",
+        )
+    )
+    assert alpha.size == expected_alpha_size
+
+    beta = index.distributions["beta-lib"]
+    assert beta.top_level == frozenset({"ns_shared", "beta_ext"})
+    assert beta.requires == frozenset()
+
+    assert index.by_import["alpha"] == ("alpha-pkg",)
+    assert index.by_import["alpha_helper"] == ("alpha-pkg",)
+    assert index.by_import["alpha_extra"] == ("alpha-pkg",)
+    assert index.by_import["ns_shared"] == ("alpha-pkg", "beta-lib")
+    assert index.by_import["beta_ext"] == ("beta-lib",)
+    assert "bin" not in index.by_import
+
+    # Real vendored store from examples/hello.
+    real_index = index_store(output / "functions" / "index.func" / "_vendor")
+    assert {"haumea", "msgspec", "vercel-runtime"} <= set(real_index.distributions)
+    haumea_dist = real_index.distributions["haumea"]
+    assert haumea_dist.top_level == frozenset({"haumea"})
+    assert "msgspec" in haumea_dist.requires
+    assert "haumea/__init__.py" in haumea_dist.files
+    assert haumea_dist.size > 0
+    assert real_index.by_import["msgspec"] == ("msgspec",)
+    assert real_index.by_import["vercel_runtime"] == ("vercel-runtime",)
+
+
+# @lat: [[tests#Build size report and limits]]
+def test_build_size_report_and_limits(tmp_path, isolated_imports, monkeypatch, capsys):
+    assert build_module.SIZE_WARN_BYTES == 250 * 1024 * 1024
+    assert build_module.SIZE_LIMIT_BYTES == 500 * 1024 * 1024
+
+    project = tmp_path / "sized"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "sized"\nversion = "0"\n',
+            "app/route.py": "def GET():\n    return {'ok': True}\n",
+            "app/ping/route.py": "def GET():\n    return {'ping': True}\n",
+        },
+    )
+
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_project(
+            vendor_dir,
+            {
+                "big_pkg-1.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.1\nName: Big_Pkg\nVersion: 1.0\n"
+                ),
+                "big_pkg-1.0.dist-info/RECORD": (
+                    "big_pkg/__init__.py,,\n"
+                    "big_pkg/blob.bin,,\n"
+                    "big_pkg-1.0.dist-info/METADATA,,\n"
+                    "big_pkg-1.0.dist-info/RECORD,,\n"
+                ),
+                "big_pkg/__init__.py": "",
+                "big_pkg/blob.bin": "x" * 8_192,
+                "med_pkg-1.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.1\nName: med-pkg\nVersion: 1.0\n"
+                ),
+                "med_pkg-1.0.dist-info/RECORD": (
+                    "med_pkg/__init__.py,,\n"
+                    "med_pkg/blob.bin,,\n"
+                    "med_pkg-1.0.dist-info/METADATA,,\n"
+                    "med_pkg-1.0.dist-info/RECORD,,\n"
+                ),
+                "med_pkg/__init__.py": "",
+                "med_pkg/blob.bin": "y" * 2_048,
+                "small_pkg-1.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.1\nName: small-pkg\nVersion: 1.0\n"
+                ),
+                "small_pkg-1.0.dist-info/RECORD": (
+                    "small_pkg/__init__.py,,\n"
+                    "small_pkg-1.0.dist-info/METADATA,,\n"
+                    "small_pkg-1.0.dist-info/RECORD,,\n"
+                ),
+                "small_pkg/__init__.py": "z = 1\n",
+            },
+        )
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+
+    # Under thresholds: prints each function's size and distribution count, no warnings.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = build(project, platform=None, output=tmp_path / "out-ok")
+    assert out.is_dir()
+    assert caught == []
+    report_out = capsys.readouterr().out
+    assert "index" in report_out
+    assert "ping" in report_out
+    assert "KB" in report_out
+    assert "3 distributions" in report_out
+
+    # Above warn threshold (and below fail limit): emits warning naming largest
+    # distributions in descending size order, and build still succeeds.
+    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 4_096)
+    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
+    with pytest.warns(UserWarning) as record:
+        out_warn = build(project, platform=None, output=tmp_path / "out-warn")
+    assert out_warn.is_dir()
+    warn_messages = [str(item.message) for item in record]
+    assert len(warn_messages) == 2
+    for func_name in ("index", "ping"):
+        msg = next(m for m in warn_messages if f"'{func_name}'" in m)
+        assert "big-pkg" in msg
+        assert "med-pkg" in msg
+        assert msg.index("big-pkg") < msg.index("med-pkg")
+    capsys.readouterr()
+
+    # Above fail limit: build fails with RuntimeError naming function and largest dists.
+    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 4_096)
+    with pytest.raises(RuntimeError) as exc_info:
+        build(project, platform=None, output=tmp_path / "out-fail")
+    error_message = str(exc_info.value)
+    assert "index" in error_message
+    assert "big-pkg" in error_message
+    assert "med-pkg" in error_message
+    capsys.readouterr()
+
+    # CLI build prints the per-function size report alongside the build summary.
+    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 1024 * 1024)
+    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 2 * 1024 * 1024)
+    monkeypatch.chdir(project)
+    cli_main(["build", "--platform", "native", "--output", str(tmp_path / "cli-out")])
+    cli_out = capsys.readouterr().out
+    assert "index" in cli_out
+    assert "ping" in cli_out
+    assert "3 distributions" in cli_out
+    assert "Build output written to" in cli_out

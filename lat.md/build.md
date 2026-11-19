@@ -30,6 +30,24 @@ The default output location is `<project_dir>/.vercel/output` ([[src/haumea/buil
 - **Deterministic output**: Generated files contain no build-time timestamps, [[src/haumea/routing.py#discover_routes]] orders routes stably by `(rank, url_path, file)`, and [[src/haumea/build.py#_dump_json]] writes `config.json`, `openapi.json`, and `.vc-config.json` with sorted keys (using [[src/haumea/build.py#_sort_keys]] when a dict mixes key types).
 - **Function trampoline**: Each `.func` directory receives `vc__handler__python.py` ([[src/haumea/build.py#TRAMPOLINE_SOURCE]]), `index.py` ([[src/haumea/build.py#ENTRYPOINT_SOURCE]] calling [[src/haumea/routing.py#create_route_app]] with the planned `base_path`), and `.vc-config.json`.
 
+## Store Index and Size Reporting
+
+[[src/haumea/build.py#emit_build]] indexes vendored distributions and reports each function's uncompressed bundle size against Vercel's limits.
+
+### Store Index
+
+[[src/haumea/build.py#index_store]] reads every `*.dist-info` directory in `_vendor/` into a [[src/haumea/build.py#StoreIndex]] of [[src/haumea/build.py#Distribution]] records.
+
+- **Normalization**: [[src/haumea/build.py#normalize_dist_name]] normalizes distribution names per PEP 503 (`[-_.]+` collapsed to `-`, lowercased), falling back to the `*.dist-info` directory prefix if `METADATA` omits `Name`.
+- **Files and sizes**: [[src/haumea/build.py#_read_record]] parses `RECORD` CSV rows into sorted in-store relative POSIX paths (ignoring absolute or escaping paths), and [[src/haumea/build.py#_distribution_size]] sums uncompressed `lstat` byte sizes across each distribution's recorded files and `*.dist-info` directory.
+- **Imports and dependencies**: [[src/haumea/build.py#_top_level_imports]] derives top-level import names from `RECORD` (top-level `.py`/`.so`/`.pyd` module stems and package directories with Python modules, excluding `*.dist-info`, `*.data`, `__pycache__`, and non-package directories like `bin/`) plus `top_level.txt` when present, mapping each import name to sorted distribution names in `by_import` to support namespace packages. [[src/haumea/build.py#_parse_requires_dist]] extracts and normalizes `Requires-Dist` names from `METADATA`, stripping version specifiers, extras, URLs, and environment markers.
+
+### Size Report and Limits
+
+[[src/haumea/build.py#_report_functions]] prints each emitted function's uncompressed bundle size ([[src/haumea/build.py#_dir_size]]) and distribution count, warns above [[src/haumea/build.py#SIZE_WARN_BYTES]], and fails above [[src/haumea/build.py#SIZE_LIMIT_BYTES]].
+
+Each [[src/haumea/build.py#FunctionReport]] currently links the entire indexed store. Above [[src/haumea/build.py#SIZE_WARN_BYTES]] (up to [[src/haumea/build.py#SIZE_LIMIT_BYTES]]), the build emits a `UserWarning` listing the largest distributions via [[src/haumea/build.py#_format_largest_distributions]]; above [[src/haumea/build.py#SIZE_LIMIT_BYTES]], it raises `RuntimeError` with the oversized functions and their largest distributions.
+
 ## Per-Route Function Config
 
 Route modules can configure their own Vercel function settings using module-level variables.

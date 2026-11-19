@@ -125,3 +125,15 @@ Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.1
 ## Dev requires uvicorn
 
 Verify [[src/haumea/cli.py#main]] exits with a `SystemExit` message pointing to `haumea[dev]` when `haumea dev` cannot import `uvicorn`.
+
+## Store index
+
+Verify [[src/haumea/build.py#normalize_dist_name]] and [[src/haumea/build.py#index_store]] record PEP 503 names, in-store `RECORD` paths, top-level import names, `Requires-Dist` names, and byte sizes.
+
+Covers a synthetic store fixture (including `top_level.txt`, namespace packages, quoted CSV paths, escaped/absolute `RECORD` entries, excluded `*.dist-info`/`*.data`/`__pycache__`/`bin/`, and missing stores) and the real `_vendor/` from `examples/hello`.
+
+## Build size report and limits
+
+Verify [[src/haumea/build.py#SIZE_WARN_BYTES]], [[src/haumea/build.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/haumea/build.py#build]] and [[src/haumea/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
+
+Lowers thresholds via `monkeypatch` to confirm warning messages name the largest distributions in descending size order while letting the build succeed, and that exceeding the fail limit raises `RuntimeError` naming the oversized function and largest distributions.
