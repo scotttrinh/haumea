@@ -30,15 +30,16 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from haumea.config import PYPROJECT, HaumeaConfig, load_config
+from haumea.config import PYPROJECT, HaumeaConfig, load_config, read_pyproject
 from haumea.openapi import swagger_html
 from haumea.routing import Route, create_app, discover_routes
 
 OUTPUT_DIR = Path(".vercel") / "output"
+UV_LOCK = "uv.lock"
 VENDOR_DIR = "_vendor"
 HANDLER_MODULE = "vc__handler__python"
 ENTRYPOINT = "index.py"
@@ -97,6 +98,34 @@ from vercel_runtime.vc_init import vc_handler  # noqa: E402,F401
 """
 
 
+def _is_uv_workspace(directory: Path) -> bool:
+    pyproject = directory / PYPROJECT
+    if not (directory / UV_LOCK).is_file() or not pyproject.is_file():
+        return False
+    tool = read_pyproject(pyproject).get("tool")
+    if not isinstance(tool, Mapping):
+        return False
+    uv = tool.get("uv")
+    return isinstance(uv, Mapping) and isinstance(uv.get("workspace"), Mapping)
+
+
+def _find_workspace_root(project_dir: Path) -> Path | None:
+    """Nearest directory from ``project_dir`` upward declaring
+    ``[tool.uv.workspace]`` alongside ``uv.lock``, or ``None``."""
+    for directory in (project_dir, *project_dir.parents):
+        if _is_uv_workspace(directory):
+            return directory
+    return None
+
+
+def _project_name(pyproject: Path) -> str | None:
+    project = read_pyproject(pyproject).get("project")
+    if not isinstance(project, Mapping):
+        return None
+    name = project.get("name")
+    return name if isinstance(name, str) and name.strip() else None
+
+
 def _run(cmd: list[str], cwd: Path) -> None:
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -104,26 +133,29 @@ def _run(cmd: list[str], cwd: Path) -> None:
 
 
 def _install_dependencies(
-    project_dir: Path, vendor_dir: Path, python: str, platform: str | None
+    workspace_root: Path,
+    vendor_dir: Path,
+    python: str,
+    platform: str | None,
+    package: str | None = None,
 ) -> None:
     """Vendor the project's locked dependencies plus Vercel's Python runtime."""
     with tempfile.TemporaryDirectory() as tmp:
         requirements = Path(tmp) / "requirements.txt"
-        _run(
-            [
-                "uv",
-                "export",
-                "--locked",
-                "--no-dev",
-                "--no-emit-project",
-                "--no-editable",
-                "--no-hashes",
-                "--quiet",
-                "-o",
-                str(requirements),
-            ],
-            cwd=project_dir,
-        )
+        export = ["uv", "export"]
+        if package is not None:
+            export += ["--package", package]
+        export += [
+            "--locked",
+            "--no-dev",
+            "--no-emit-project",
+            "--no-editable",
+            "--no-hashes",
+            "--quiet",
+            "-o",
+            str(requirements),
+        ]
+        _run(export, cwd=workspace_root)
         cmd = [
             "uv",
             "pip",
@@ -139,7 +171,7 @@ def _install_dependencies(
         ]
         if platform:
             cmd += ["--python-platform", platform]
-        _run(cmd, cwd=project_dir)
+        _run(cmd, cwd=workspace_root)
 
 
 @dataclass(frozen=True)
@@ -170,6 +202,9 @@ class BuildPlan:
 
     project_dir: Path
     workspace_root: Path
+    package: str | None
+    """Workspace package name for ``uv export --package``, or None outside a
+    workspace."""
     app_dir: Path
     public_dir: Path | None
     """The project's ``public/`` directory, or None if it has none."""
@@ -327,6 +362,15 @@ def plan_build(
     if not pyproject.is_file():
         raise FileNotFoundError(f"no pyproject.toml in {project_dir}")
     config = load_config(pyproject)
+    discovered_workspace = _find_workspace_root(project_dir)
+    if discovered_workspace is not None:
+        workspace_root = discovered_workspace
+        package = _project_name(pyproject)
+        if package is None:
+            raise ValueError(f"missing [project].name in {pyproject}")
+    else:
+        workspace_root = project_dir
+        package = None
     base_path = config.base_path
     app_dir = project_dir / "app"
     public: Path | None = project_dir / "public"
@@ -341,7 +385,8 @@ def plan_build(
     # Plan.
     return BuildPlan(
         project_dir=project_dir,
-        workspace_root=project_dir,
+        workspace_root=workspace_root,
+        package=package,
         app_dir=app_dir,
         public_dir=public,
         output_dir=output_dir,
@@ -397,7 +442,11 @@ def emit_build(plan: BuildPlan) -> Path:
         shutil.copytree(plan.project_dir, shared, ignore=_ignore_path(output, IGNORE))
         (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
         _install_dependencies(
-            plan.project_dir, shared / VENDOR_DIR, plan.python, plan.platform
+            plan.workspace_root,
+            shared / VENDOR_DIR,
+            plan.python,
+            plan.platform,
+            plan.package,
         )
         for spec in plan.functions:
             _write_function(spec, shared, output / "functions")

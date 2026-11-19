@@ -107,3 +107,13 @@ Verify [[src/haumea/build.py#build]] fails with `RuntimeError` when `uv.lock` is
 ## Deterministic build output
 
 Verify repeated builds of the same project into separate directories produce byte-for-byte identical trees and that `config.json`, `openapi.json`, and `.vc-config.json` serialize with sorted keys.
+
+## Workspace discovery
+
+Verify [[src/haumea/build.py#plan_build]] discovers the nearest ancestor declaring `[tool.uv.workspace]` alongside `uv.lock`, sets `package` from `[project].name` in workspaces (`None` outside), and rejects unnamed workspace projects.
+
+Covers ancestors missing `uv.lock` or `[tool.uv.workspace]`, nested workspaces where the nearest match wins, a non-virtual workspace root acting as a service, and `ValueError` rejection for unnamed workspace members or virtual roots.
+
+## Workspace build
+
+Verify [[src/haumea/build.py#build]] on a uv workspace with `apps/api`, `packages/core`, and an unrelated `apps/worker`/`packages/unused` sibling resolves `workspace_root`, vendors `core` non-editably, omits `api` and `unused`, and serves `core` via `vc_handler`.

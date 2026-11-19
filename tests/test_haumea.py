@@ -197,6 +197,7 @@ def test_build_plan(tmp_path, isolated_imports):
     plan = plan_build(project, python="3.13")
 
     assert plan.project_dir == plan.workspace_root == project
+    assert plan.package is None
     assert plan.app_dir == project / "app"
     assert plan.public_dir == project / "public"
     assert plan.output_dir == project / ".vercel" / "output"
@@ -572,7 +573,9 @@ def test_root_path_reconstruction(prefixed_project, isolated_imports):
 def prefixed_output(prefixed_project):
     install = build_module._install_dependencies
 
-    def install_like_example(project_dir, vendor_dir, python, platform):
+    def install_like_example(
+        workspace_root, vendor_dir, python, platform, package=None
+    ):
         # Same dependencies as examples/hello, which has a lock to export.
         install(EXAMPLE, vendor_dir, python, platform)
 
@@ -980,3 +983,184 @@ def test_deterministic_build_output(tmp_path, isolated_imports, monkeypatch):
     for vc_config in sorted((out1 / "functions").rglob(".vc-config.json")):
         text = vc_config.read_text()
         assert text == json.dumps(json.loads(text), indent=2, sort_keys=True)
+
+
+# @lat: [[tests#Workspace discovery]]
+def test_workspace_root_discovery(tmp_path, isolated_imports):
+    # Non-workspace project falls back to project_dir, even under an ancestor
+    # with pyproject.toml or [tool.uv.workspace] lacking uv.lock.
+    outer = tmp_path / "outer"
+    write_project(
+        outer,
+        {
+            "pyproject.toml": '[tool.uv.workspace]\nmembers = ["apps/*"]\n',
+            "apps/solo/pyproject.toml": '[project]\nname = "solo"\nversion = "0"\n',
+            "apps/solo/app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    solo = (outer / "apps" / "solo").resolve()
+    solo_plan = plan_build(solo)
+    assert solo_plan.workspace_root == solo
+    assert solo_plan.package is None
+
+    # Adding uv.lock at the ancestor makes it the workspace root.
+    (outer / "uv.lock").write_text("version = 1\n")
+    solo_ws_plan = plan_build(solo)
+    assert solo_ws_plan.workspace_root == outer.resolve()
+    assert solo_ws_plan.package == "solo"
+
+    # Nearest ancestor with both [tool.uv.workspace] and uv.lock wins.
+    inner = outer / "sub"
+    write_project(
+        inner,
+        {
+            "pyproject.toml": '[tool.uv.workspace]\nmembers = ["svc", "unnamed"]\n',
+            "svc/pyproject.toml": '[project]\nname = "svc"\nversion = "0"\n',
+            "svc/app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    svc = (inner / "svc").resolve()
+    # inner lacks uv.lock, so outer wins.
+    svc_outer_plan = plan_build(svc)
+    assert svc_outer_plan.workspace_root == outer.resolve()
+    assert svc_outer_plan.package == "svc"
+    # Once inner also has uv.lock, inner (nearest) wins.
+    (inner / "uv.lock").write_text("version = 1\n")
+    svc_inner_plan = plan_build(svc)
+    assert svc_inner_plan.workspace_root == inner.resolve()
+    assert svc_inner_plan.package == "svc"
+
+    # A workspace member without [project].name cannot be exported by package name.
+    unnamed = inner / "unnamed"
+    write_project(
+        unnamed,
+        {
+            "pyproject.toml": '[tool.haumea]\nbase_path = "/api"\n',
+            "app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    with pytest.raises(ValueError, match="name"):
+        plan_build(unnamed)
+
+    # An ancestor with uv.lock but without [tool.uv.workspace] is not a workspace root.
+    plain_parent = tmp_path / "plain_parent"
+    write_project(
+        plain_parent,
+        {
+            "pyproject.toml": '[project]\nname = "parent"\nversion = "0"\n',
+            "uv.lock": "version = 1\n",
+            "child/pyproject.toml": '[project]\nname = "child"\nversion = "0"\n',
+            "child/app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    child = (plain_parent / "child").resolve()
+    child_plan = plan_build(child)
+    assert child_plan.workspace_root == child
+    assert child_plan.package is None
+
+    # A workspace root that is itself a Haumea project resolves to itself,
+    # while a virtual workspace root without [project].name is rejected.
+    root_svc = tmp_path / "root_svc"
+    write_project(
+        root_svc,
+        {
+            "pyproject.toml": (
+                '[project]\nname = "root-svc"\nversion = "0"\n\n'
+                "[tool.uv.workspace]\nmembers = []\n"
+            ),
+            "uv.lock": "version = 1\n",
+            "app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    root_svc_plan = plan_build(root_svc)
+    assert root_svc_plan.workspace_root == root_svc.resolve()
+    assert root_svc_plan.package == "root-svc"
+
+    virtual_root = tmp_path / "virtual_root"
+    write_project(
+        virtual_root,
+        {
+            "pyproject.toml": "[tool.uv.workspace]\nmembers = []\n",
+            "uv.lock": "version = 1\n",
+            "app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    with pytest.raises(ValueError, match="name"):
+        plan_build(virtual_root)
+
+
+# @lat: [[tests#Workspace build]]
+def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
+    repo_root = Path(__file__).parent.parent.resolve()
+    workspace = tmp_path / "workspace"
+    write_project(
+        workspace,
+        {
+            "pyproject.toml": (
+                '[tool.uv.workspace]\nmembers = ["apps/*", "packages/*"]\n'
+            ),
+            "packages/core/pyproject.toml": (
+                '[project]\nname = "core"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\ndependencies = []\n\n'
+                '[build-system]\nrequires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n'
+            ),
+            "packages/core/src/core/__init__.py": (
+                'def greet(who: str) -> str:\n    return f"hello {who} from core"\n'
+            ),
+            "packages/unused/pyproject.toml": (
+                '[project]\nname = "unused"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\ndependencies = []\n\n'
+                '[build-system]\nrequires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n'
+            ),
+            "packages/unused/src/unused/__init__.py": "VALUE = 1\n",
+            "apps/worker/pyproject.toml": (
+                '[project]\nname = "worker"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\ndependencies = ["unused"]\n\n'
+                "[tool.uv.sources]\nunused = { workspace = true }\n"
+            ),
+            "apps/api/pyproject.toml": (
+                '[project]\nname = "api"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\n'
+                'dependencies = ["haumea", "core"]\n\n'
+                '[build-system]\nrequires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n\n'
+                "[tool.hatch.build.targets.wheel]\n"
+                'packages = ["src/api_pkg"]\n\n'
+                "[tool.uv.sources]\n"
+                f"haumea = {{ path = {json.dumps(repo_root.as_posix())},"
+                " editable = true }\n"
+                "core = { workspace = true }\n"
+            ),
+            "apps/api/src/api_pkg/__init__.py": 'MARKER = "api"\n',
+            "apps/api/app/route.py": (
+                "from core import greet\n\n"
+                'def GET(name: str = "world"):\n'
+                '    return {"greeting": greet(name)}\n'
+            ),
+        },
+    )
+    subprocess.run(["uv", "lock", "--quiet"], cwd=workspace, check=True)
+
+    # Mirror the workspace environment during planning so route.py can import core;
+    # invoke() runs in a fresh `python -S` subprocess with only _vendor/ on sys.path.
+    monkeypatch.syspath_prepend(str(workspace / "packages" / "core" / "src"))
+
+    api = workspace / "apps" / "api"
+    plan = plan_build(api, platform=None)
+    assert plan.project_dir == api.resolve()
+    assert plan.workspace_root == workspace.resolve()
+    assert plan.package == "api"
+
+    output = build(api, platform=None)
+    assert output == api.resolve() / ".vercel" / "output"
+
+    vendor = output / "functions" / "index.func" / "_vendor"
+    assert (vendor / "core" / "__init__.py").is_file()
+    assert not (vendor / "unused").exists()
+    assert not (vendor / "api_pkg").exists()
+
+    response = invoke(output, "index", "/?name=haumea")
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"greeting": "hello haumea from core"}

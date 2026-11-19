@@ -58,14 +58,19 @@ class HaumeaConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         msgspec.structs.force_setattr(self, "base_path", normalized)
 
 
+def read_pyproject(pyproject: str | Path) -> dict[str, object]:
+    """Parse ``pyproject`` as TOML without importing user code."""
+    with Path(pyproject).open("rb") as file:
+        return tomllib.load(file)
+
+
 def load_config(pyproject: str | Path) -> HaumeaConfig:
     """Read ``[tool.haumea]`` from ``pyproject``; defaults if the table is absent.
 
     Raises ``ValueError`` for unknown keys or invalid values.
     """
     pyproject = Path(pyproject)
-    with pyproject.open("rb") as file:
-        tool = tomllib.load(file).get("tool", {})
+    tool = read_pyproject(pyproject).get("tool", {})
     error = f"invalid [tool.haumea] in {pyproject}"
     if not isinstance(tool, Mapping):
         raise ValueError(f"{error}: `tool` must be a table")
