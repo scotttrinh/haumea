@@ -150,14 +150,19 @@ class Haumea:
         include_in_schema: bool = True,
         middleware: Sequence[Middleware] = (),
         error_handlers: Sequence[ErrorHandler] = (),
+        dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
         serves it without documenting it in OpenAPI.
 
         ``middleware`` wraps every method of ``path``, outermost first.
         ``error_handlers`` (root to leaf) handle its endpoint's errors,
-        nearest first. Each call for one path must pass the same chains."""
-        endpoint = Endpoint(handler, {m[1] for m in _PATH_PARAM.finditer(path)})
+        nearest first. Each call for one path must pass the same chains.
+        ``dependencies`` holds one group of checks per segment, root to leaf;
+        they run in that order before ``handler``'s arguments, sharing their
+        per-request ``Depends`` cache."""
+        path_params = {m[1] for m in _PATH_PARAM.finditer(path)}
+        endpoint = Endpoint(handler, path_params, dependencies)
         endpoints = next((e for p, _, e in self.routes if p == path), None)
         chain, handlers = tuple(middleware), tuple(error_handlers)
         if endpoints is None:

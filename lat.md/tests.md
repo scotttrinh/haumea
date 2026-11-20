@@ -386,6 +386,98 @@ Verify `raises` rejects success, redirect-boundary and out-of-range statuses wit
 
 Verify `raises` rejects non-`int` statuses (`401.5`, `"401"`, `True`, `None`) with `TypeError`, so a response key such as `"401.5"` never reaches the schema.
 
+## Inherited typed dependencies
+
+Verify `dependencies.py` checks on a project with a protected `(group)`, a nested `admin` check, a handler requesting the inherited callable, a newly added route and a public sibling.
+
+### Run root to leaf before the handler
+
+Under both factories, independent checks prove the group's run before the admin directory's and the handler, once per request even though the admin check and handler `Depends` on them; the new route inherits both and the sibling runs none.
+
+### Rejection stops the handler
+
+Under both factories, a missing bearer token (`401`) or a non-admin (`403`) answers through the group's `error.py` before the handler runs, keeping `WWW-Authenticate`.
+
+### Check validation stops the handler
+
+Verify a check whose own query input fails validation answers `422` naming only that input, and neither the check nor the handler runs.
+
+### No check without a selected handler
+
+Under both factories, a 405 on a protected route and a 404 under a protected directory run no inherited check.
+
+### Documented once without running
+
+Verify protected operations document one bearer `security` requirement, one shared `tenant` input, no `authorization` header and the checks' `401`/`403`, without calling a check.
+
+The build's `openapi.json` matches dev, and the public sibling documents no security, parameters or error responses.
+
+### Declared response precedence
+
+Verify a repeated `raises` status prefers the handler, then its direct dependency, then inherited checks nearest segment first and, within a segment, the first declared.
+
+### Async callable checks
+
+Verify an inherited check that is an instance with `async def __call__`, or a sync callable returning a coroutine, is awaited and its `403` stops the handler, and an async callable `Depends` yields its value.
+
+### Unhashable callable checks
+
+Verify a non-frozen dataclass instance works as an inherited check and as the handler's `Depends` under both factories: it runs once per request, rejects, and documents its header once.
+
+### Shared input stays required
+
+Verify an input optional in a check but required by the handler is documented as required, matching the `422` when it is omitted.
+
+### Distinct equal callables
+
+Verify two distinct inherited checks that compare equal (frozen dataclasses) both run, so the second one's `403` stops the handler.
+
+### Bound method checks run once
+
+Verify a bound method used as an inherited check and as the handler's `Depends` runs once per request, though each `obj.method` access makes a new object.
+
+### Shared inputs keep every constraint
+
+Verify a query parameter and a keyed body field read by a check and the handler with different constraints document the `allOf` of both, matching requests rejected by either.
+
+Identical schemas stay a single schema, and an input is required if any consumer requires it.
+
+### Generator checks are rejected
+
+Verify sync and async generator functions, and instances whose `__call__` is one, fail `add_route` and both factories with a `TypeError`, instead of being called and skipped.
+
+### Mixed list and scalar query inputs
+
+Verify a query input read as `list[int]` by a check and as `int` by the handler makes schema generation raise `ValueError`, while the same list shape everywhere stays one input.
+
+### Keyed body list and scalar consumers
+
+Verify a keyed body field read as `Any` by a check and `list[int]` by the handler documents both schemas without raising, matching a list body accepted and a scalar rejected.
+
+### Checks returning generators fail closed
+
+Verify `functools.wraps` wrappers returning a generator or async generator, including one already cached by an earlier check's `Depends`, fail the request without running the handler.
+
+### Header names are case-insensitive
+
+Verify `X-Key` in a check and `x-key` in the handler document one header, required, with both schemas, matching requests rejected by either consumer.
+
+### Body consumers across checks
+
+Verify whole-body consumers and a multi-field check document the request body as `allOf` of their schemas, a body satisfying all succeeds and one missing a key fails, and a lone consumer keeps its plain schema.
+
+### Shared inputs are documented once
+
+Verify an input reached through several dependencies and an inherited check, or a dependency used twice, is documented as one parameter while requests still resolve it.
+
+### Invalid dependencies.py
+
+Verify a missing `dependencies`, a string, a set, a non-callable item or a `Depends(...)` marker fails both factories with a `TypeError` naming `dependencies.py`.
+
+### Trace roots and bundling
+
+Verify a group's `dependencies.py` is a trace root of the functions beneath it, its package is bundled only there and not into the sibling, and the built schema documents the check's header and `403`.
+
 ## Lazy values
 
 Tests for [[src/haumea/params.py#lazy]]: one creation per process for sync and async factories, retry after failure, and use as a dependency.

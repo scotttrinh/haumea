@@ -20,7 +20,8 @@ import functools
 import inspect
 import re
 import threading
-from collections.abc import Callable, Coroutine, Iterator
+import types
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, get_args, get_origin, overload
 
@@ -192,6 +193,17 @@ def _is_async(factory: Callable[..., Any]) -> bool:
     )
 
 
+def is_generator_callable(func: Callable[..., Any]) -> bool:
+    """A sync or async generator function, or an instance whose ``__call__``
+    is one. Calling it only creates a generator, so as a check it would
+    never run. Wrappers can hide one, so ``Endpoint.call`` also refuses a
+    check whose result is a generator."""
+    return any(
+        inspect.isgeneratorfunction(target) or inspect.isasyncgenfunction(target)
+        for target in (func, type(func).__call__)
+    )
+
+
 def _named(func: Callable[[], Any], factory: Callable[..., Any]) -> Callable[[], Any]:
     """Copy ``factory``'s name and docs without ``__wrapped__``, which would
     make ``inspect.signature`` report the factory's parameters."""
@@ -209,6 +221,9 @@ class Field:
     annotation: Any  # as written, including any Annotated[..., Meta(...)]
     default: Any = _MISSING
     dependency: Endpoint | None = None
+    embed: bool = False
+    """A body field that is one key of a JSON object, because its function
+    has several body fields; otherwise it decodes the whole body."""
 
     @property
     def required(self) -> bool:
@@ -222,51 +237,175 @@ class Field:
         return get_origin(annotation) in (list, set, tuple)
 
 
-class Endpoint:
-    """A handler (or dependency) plus the plan for building its arguments."""
+def _key(func: Callable[..., Any]) -> Any:
+    """``func``'s identity for the per-request cache and schema traversal.
 
-    def __init__(self, func: Callable[..., Any], path_params: set[str]) -> None:
+    Distinct callables never share a key, even when they compare equal. A
+    bound method is keyed by its instance and function, since each
+    ``obj.method`` access makes a new method object. The ``Endpoint`` tree
+    holds every callable, so the ids stay valid."""
+    if isinstance(func, types.MethodType):
+        return (id(func.__self__), id(func.__func__))
+    return id(func)
+
+
+@dataclass
+class RequestInput:
+    """One documented request input and every field that reads it."""
+
+    fields: list[Field]
+    """Its consumers, first use first; all share ``source`` and ``alias``."""
+
+    @property
+    def source(self) -> str:
+        return self.fields[0].source
+
+    @property
+    def alias(self) -> str:
+        return self.fields[0].alias
+
+    @property
+    def embed(self) -> bool:
+        return self.fields[0].embed
+
+    @property
+    def required(self) -> bool:
+        """Required if any consumer requires it, since each one validates."""
+        return any(field.required for field in self.fields)
+
+    @property
+    def annotations(self) -> list[Any]:
+        return [field.annotation for field in self.fields]
+
+
+class Endpoint:
+    """A handler (or dependency) plus the plan for building its arguments.
+
+    ``dependencies`` are inherited checks, one group per segment, root to
+    leaf: each runs before the handler's arguments are resolved, sharing
+    their per-request cache, and its result is discarded unless a
+    ``Depends`` requests the same callable.
+    """
+
+    def __init__(
+        self,
+        func: Callable[..., Any],
+        path_params: set[str],
+        dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
+    ) -> None:
         self.func = func
-        self.fields = [
+        fields = [
             _field(parameter, path_params)
             for parameter in inspect.signature(func, eval_str=True).parameters.values()
         ]
+        if sum(field.source == "body" for field in fields) > 1:
+            for field in fields:
+                field.embed = field.source == "body"
+        self.fields = fields
+        for check in (check for group in dependencies for check in group):
+            if is_generator_callable(check):
+                raise TypeError(
+                    f"inherited check {check!r} is a generator function: it "
+                    "would never run; use a plain or async function"
+                )
+        self.check_groups = [
+            [Endpoint(check, path_params) for check in group] for group in dependencies
+        ]
+        self.checks = [check for group in self.check_groups for check in group]
+        """The inherited checks in run order, root to leaf."""
 
-    def request_fields(self) -> Iterator[Field]:
-        """Every field read from the request, including via dependencies."""
-        for field in self.fields:
-            if field.dependency:
-                yield from field.dependency.request_fields()
-            elif field.source != "request":
-                yield field
+    def _walk(self) -> Iterator[Endpoint | Field]:
+        """Inherited checks root to leaf, then this endpoint: each callable
+        once, as it runs once per request, followed by its own fields in
+        parameter order with each ``Depends`` walked in place. Never calls
+        anything."""
+        seen: set[Any] = set()
+
+        def visit(endpoint: Endpoint) -> Iterator[Endpoint | Field]:
+            seen.add(_key(endpoint.func))
+            yield endpoint
+            for field in endpoint.fields:
+                if not field.dependency:
+                    yield field
+                elif _key(field.dependency.func) not in seen:
+                    yield from visit(field.dependency)
+
+        for check in self.checks:
+            if _key(check.func) not in seen:
+                yield from visit(check)
+        yield from visit(self)
+
+    def request_inputs(self) -> list[RequestInput]:
+        """Every input read from the request, including via dependencies and
+        inherited checks, in first-use order.
+
+        A path, query, header, cookie or embedded body input repeated across
+        callables (same source and alias, header names case-insensitively)
+        is one input holding every consumer. Each whole-body field is its own
+        input, since each decodes the entire body. A query input read as a
+        list by one consumer and as a single value by another has no schema
+        both accept, so it raises ``ValueError``."""
+        inputs: dict[Any, RequestInput] = {}
+        for field in self._walk():
+            if not isinstance(field, Field) or field.source == "request":
+                continue
+            whole = field.source == "body" and not field.embed
+            alias = field.alias.lower() if field.source == "header" else field.alias
+            key = object() if whole else (field.source, alias)
+            request_input = inputs.setdefault(key, RequestInput([]))
+            # Only query strings switch between one value and repeated values;
+            # other sources decode as their annotation says.
+            first = request_input.fields[0] if request_input.fields else None
+            if field.source == "query" and first and first.is_list != field.is_list:
+                raise ValueError(
+                    f"{field.source} input {field.alias!r} is read as a list by "
+                    "one dependency and as a single value by another"
+                )
+            request_input.fields.append(field)
+        return list(inputs.values())
 
     def security_schemes(self) -> Iterator[HTTPBearer]:
-        """Every credential scheme this endpoint or its dependencies use."""
-        if isinstance(self.func, HTTPBearer):
-            yield self.func
-        for field in self.fields:
-            if field.dependency:
-                yield from field.dependency.security_schemes()
+        """Every credential scheme used here, by a dependency or a check."""
+        for endpoint in self._walk():
+            if isinstance(endpoint, Endpoint) and isinstance(endpoint.func, HTTPBearer):
+                yield endpoint.func
 
     def declared_responses(self) -> dict[int, str]:
-        """Error responses declared with ``raises``, here and in dependencies.
+        """Error responses declared with ``raises``, here, in dependencies
+        and in inherited checks.
 
         The first declaration of a status wins, visiting level by level: this
-        function, then its direct dependencies in parameter order, then
-        theirs. A nearer declaration so beats a deeper one in any branch.
+        function; then its direct dependencies in parameter order, followed
+        by its inherited checks nearest segment first and in declared order
+        within a segment; then their dependencies, and so on. A nearer
+        declaration so beats a deeper one in any branch.
         """
         declared: dict[int, str] = {}
         level: list[Endpoint] = [self]
+        checks = [check for group in reversed(self.check_groups) for check in group]
         while level:
             for endpoint in level:
                 for status, description in getattr(endpoint.func, _RAISES, {}).items():
                     declared.setdefault(status, description)
             level = [f.dependency for e in level for f in e.fields if f.dependency]
+            level, checks = [*level, *checks], []
         return declared
 
     async def call(self, request: Request) -> Any:
         errors: list[dict[str, Any]] = []
-        result = await self._call(request, {}, errors)
+        cache: dict[Any, Any] = {}
+        for check in self.checks:  # root to leaf, before any argument
+            result = await _depend(check, request, cache, errors)
+            if errors:
+                raise RequestValidationError(errors)
+            if inspect.isgenerator(result) or inspect.isasyncgen(result):
+                # A wrapper hid a generator from is_generator_callable: its
+                # body never ran, so the check never passed.
+                raise TypeError(
+                    f"inherited check {check.func!r} returned a generator "
+                    "instead of running"
+                )
+        result = await self._call(request, cache, errors)
         if errors:
             raise RequestValidationError(errors)
         return result
@@ -274,31 +413,37 @@ class Endpoint:
     async def _call(
         self, request: Request, cache: dict[Any, Any], errors: list[dict[str, Any]]
     ) -> Any:
+        """Call ``func`` with resolved arguments: async callables (including
+        instances with ``async def __call__``) on the loop, others in a
+        worker thread. An awaitable result, such as a sync wrapper's
+        coroutine, is awaited, so a check can never be skipped unawaited."""
         kwargs = await self._resolve(request, cache, errors)
         if errors:
             return None
-        if inspect.iscoroutinefunction(self.func):
-            return await self.func(**kwargs)
-        return await asyncio.to_thread(self.func, **kwargs)
+        if _is_async(self.func):
+            result = self.func(**kwargs)
+        else:
+            result = await asyncio.to_thread(self.func, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def _resolve(
         self, request: Request, cache: dict[Any, Any], errors: list[dict[str, Any]]
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
-        body_fields = [field for field in self.fields if field.source == "body"]
         body = _MISSING
-        if len(body_fields) > 1:  # each field is a key of a JSON object
+        if any(field.embed for field in self.fields):  # keys of a JSON object
             body = _decode_body(await request.body(), dict[str, Any], errors)
 
         for field in self.fields:
             if field.source == "request":
                 kwargs[field.name] = request
             elif field.dependency:
-                func = field.dependency.func
-                if func not in cache:  # each dependency runs once per request
-                    cache[func] = await field.dependency._call(request, cache, errors)
-                kwargs[field.name] = cache[func]
-            elif field.source == "body" and len(body_fields) == 1:
+                kwargs[field.name] = await _depend(
+                    field.dependency, request, cache, errors
+                )
+            elif field.source == "body" and not field.embed:
                 # Decode and validate straight from the bytes, in one pass.
                 value = _decode_body(await request.body(), field.annotation, errors)
                 kwargs[field.name] = _or_default(field, value, ["body"], errors)
@@ -323,6 +468,20 @@ class Endpoint:
                         raw = values[-1]
                 kwargs[field.name] = _convert(field, raw, strict=False, errors=errors)
         return kwargs
+
+
+async def _depend(
+    dependency: Endpoint,
+    request: Request,
+    cache: dict[Any, Any],
+    errors: list[dict[str, Any]],
+) -> Any:
+    """``dependency``'s result, running it only on its first use in this
+    request: inherited checks and ``Depends`` share ``cache``."""
+    key = _key(dependency.func)
+    if key not in cache:
+        cache[key] = await dependency._call(request, cache, errors)
+    return cache[key]
 
 
 _ERROR_PATH = re.compile(r" - at `\$(.*)`$")

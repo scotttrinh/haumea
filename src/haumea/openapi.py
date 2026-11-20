@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from haumea.params import Endpoint
+from haumea.params import Endpoint, RequestInput
 from haumea.responses import Response
 
 if TYPE_CHECKING:
@@ -41,6 +41,18 @@ def _schema(annotation: Any, components: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+def _input_schema(
+    request_input: RequestInput, components: dict[str, Any]
+) -> dict[str, Any]:
+    """The schema every consumer of ``request_input`` accepts: its one
+    distinct schema, or the ``allOf`` of them, since each one validates."""
+    schemas: list[dict[str, Any]] = []
+    for annotation in request_input.annotations:
+        if (schema := _schema(annotation, components)) not in schemas:
+            schemas.append(schema)
+    return schemas[0] if len(schemas) == 1 else {"allOf": schemas}
+
+
 def _operation(
     method: str,
     path: str,
@@ -56,13 +68,13 @@ def _operation(
     if "\n" in doc:
         operation["description"] = doc
 
-    fields = list(endpoint.request_fields())
+    fields = endpoint.request_inputs()
     parameters = [
         {
             "name": field.alias,
             "in": field.source,
             "required": field.required,
-            "schema": _schema(field.annotation, components),
+            "schema": _input_schema(field, components),
         }
         for field in fields
         if field.source != "body"
@@ -71,14 +83,23 @@ def _operation(
         operation["parameters"] = parameters
 
     body = [field for field in fields if field.source == "body"]
-    if len(body) == 1:
-        body_schema = _schema(body[0].annotation, components)
-    else:
-        body_schema = {
-            "type": "object",
-            "properties": {f.alias: _schema(f.annotation, components) for f in body},
-            "required": [f.alias for f in body if f.required],
-        }
+    # Each whole-body field decodes the entire body; embedded ones are keys
+    # of one JSON object. A request must satisfy all of them at once.
+    parts: list[dict[str, Any]] = []
+    for field in body:
+        if field.embed:
+            continue
+        if (part := _input_schema(field, components)) not in parts:
+            parts.append(part)
+    if embedded := [field for field in body if field.embed]:
+        parts.append(
+            {
+                "type": "object",
+                "properties": {f.alias: _input_schema(f, components) for f in embedded},
+                "required": [f.alias for f in embedded if f.required],
+            }
+        )
+    body_schema = parts[0] if len(parts) == 1 else {"allOf": parts}
     if body:
         operation["requestBody"] = {
             "required": any(field.required for field in body),

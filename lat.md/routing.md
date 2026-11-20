@@ -16,7 +16,7 @@ With a normalized `base_path` ([[config#Base Path]]), `url_path`, `function` and
 
 Each [[src/haumea/routing.py#Route]] also records `segments`: the directories from the resolved `app_dir` down to the route's own directory, inclusive and ordered root to leaf. Route groups and dynamic directories count, so `app/(admin)/users/route.py` has `app/`, `app/(admin)/`, `app/(admin)/users/`, and `app/route.py` has just `app/`.
 
-[[src/haumea/routing.py#Route#segment_files]] lists the existing named files across the segments, root to leaf (in the given name order within a segment); the build uses it for trace roots ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]). [[src/haumea/routing.py#Route#load_segments]] loads a named file from each segment directory that has one, root to leaf, via [[src/haumea/routing.py#load_module]]. It reads only the route's own ancestors, never a sibling directory, and returns an empty list when no ancestor has the file. Both app factories use it to load `middleware.py` ([[routing#Middleware]]) and `error.py` ([[routing#Error Boundaries]]).
+[[src/haumea/routing.py#Route#segment_files]] lists the existing named files across the segments, root to leaf (in the given name order within a segment); the build uses it for trace roots ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]). [[src/haumea/routing.py#Route#load_segments]] loads a named file from each segment directory that has one, root to leaf, via [[src/haumea/routing.py#load_module]]. It reads only the route's own ancestors, never a sibling directory, and returns an empty list when no ancestor has the file. Both app factories use it to load `middleware.py` ([[routing#Middleware]]), `error.py` ([[routing#Error Boundaries]]) and `dependencies.py` ([[routing#Inherited Dependencies]]).
 
 Routes are sorted by `(route.rank, route.url_path)` so static paths (e.g. `/items/new`) match before dynamic ones (`/items/{item_id}`), and catch-alls match last. When discovering routes, [[src/haumea/routing.py#discover_routes]] also prepends `app_dir.parent` to `sys.path` so route modules can import sibling project packages.
 
@@ -73,6 +73,14 @@ When the endpoint call in [[src/haumea/app.py#Haumea#_endpoint_call]] raises (in
 - **Where it runs**: only for endpoint errors after a route matches. Exceptions raised by middleware skip `error.py` and get the default mapping in [[src/haumea/app.py#Haumea#__call__]]; unmatched paths and dev files run no `error.py`.
 
 *Note on non-obvious behavior*: [[src/haumea/app.py#Haumea#__call__]] ignores non-`http`/non-`lifespan` ASGI scopes (e.g. `websocket`) by returning immediately.
+
+## Inherited Dependencies
+
+A `dependencies.py` in any segment exports `dependencies`, a `list` or `tuple` of dependency callables that every method at or below its directory runs before its handler.
+
+[[src/haumea/routing.py#_dependencies]] loads [[src/haumea/routing.py#DEPENDENCIES_FILE]] via [[src/haumea/routing.py#Route#load_segments]] after `middleware.py` and `error.py`, returning one group per file, root to leaf, in declared order. A missing name, any other container (a string or a set), a non-callable item, including a `Depends(...)` marker, or a generator callable ([[src/haumea/params.py#is_generator_callable]]) raises `TypeError` naming the file. [[src/haumea/routing.py#_add_route]] passes them to [[src/haumea/app.py#Haumea#add_route]] for each method, which attaches them to that method's [[src/haumea/params.py#Endpoint]], so both factories build the same checks ([[params#Inherited Checks]]). Route groups count, so `app/(admin)/dependencies.py` protects every route in the group without changing URLs.
+
+The checks run inside [[src/haumea/params.py#Endpoint#call]], within the error boundary and middleware, so a rejection passes through `error.py` and middleware like any handler error. A 404 or 405 selects no endpoint and runs no check.
 
 ## Schema Visibility
 

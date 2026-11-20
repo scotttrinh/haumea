@@ -27,17 +27,21 @@ import importlib.util
 import inspect
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from haumea.app import ErrorHandler, Haumea, Middleware
 from haumea.config import normalize_base_path, project_base_path
+from haumea.params import is_generator_callable
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
 MIDDLEWARE_FILE = "middleware.py"
 ERROR_FILE = "error.py"
+DEPENDENCIES_FILE = "dependencies.py"
 
 
 def load_module(path: Path) -> ModuleType:
@@ -192,9 +196,32 @@ def _error_handlers(route: Route) -> list[ErrorHandler]:
     return handlers
 
 
+def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
+    """Each ancestor ``dependencies.py``'s ``dependencies``, one group per
+    file, root to leaf and in declared order within each."""
+    groups: list[list[Callable[..., Any]]] = []
+    for module in route.load_segments(DEPENDENCIES_FILE):
+        declared = getattr(module, "dependencies", None)
+        if not isinstance(declared, list | tuple) or not all(
+            callable(check) for check in declared
+        ):
+            raise TypeError(
+                f"invalid `dependencies` in {module.__file__}: expected a list "
+                f"or tuple of dependency callables, got {declared!r}"
+            )
+        if generators := [check for check in declared if is_generator_callable(check)]:
+            raise TypeError(
+                f"invalid `dependencies` in {module.__file__}: generator "
+                f"functions never run as checks, got {generators!r}"
+            )
+        groups.append(list(declared))
+    return groups
+
+
 def _add_route(app: Haumea, route: Route) -> None:
     middleware = _middleware(route)
     error_handlers = _error_handlers(route)
+    dependencies = _dependencies(route)
     module = route.load()
     include_in_schema = _include_in_schema(module, route)
     for method in HTTP_METHODS:
@@ -207,6 +234,7 @@ def _add_route(app: Haumea, route: Route) -> None:
                 include_in_schema=include_in_schema,
                 middleware=middleware,
                 error_handlers=error_handlers,
+                dependencies=dependencies,
             )
 
 

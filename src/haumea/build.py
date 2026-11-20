@@ -47,6 +47,7 @@ from types import ModuleType
 from haumea.config import PYPROJECT, HaumeaConfig, load_config, read_pyproject
 from haumea.openapi import swagger_html
 from haumea.routing import (
+    DEPENDENCIES_FILE,
     ERROR_FILE,
     MIDDLEWARE_FILE,
     Route,
@@ -511,7 +512,10 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
             function=route.function, base_path=base_path
         ),
         vc_config=config,
-        trace_roots=(route.file, *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE)),
+        trace_roots=(
+            route.file,
+            *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE, DEPENDENCIES_FILE),
+        ),
         include=_read_route_include(module, route),
     )
 
