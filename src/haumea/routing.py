@@ -24,17 +24,19 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-from haumea.app import Haumea
+from haumea.app import Haumea, Middleware
 from haumea.config import normalize_base_path, project_base_path
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
+MIDDLEWARE_FILE = "middleware.py"
 
 
 def load_module(path: Path) -> ModuleType:
@@ -155,7 +157,22 @@ def _include_in_schema(module: ModuleType, route: Route) -> bool:
     return include
 
 
+def _middleware(route: Route) -> list[Middleware]:
+    """Each ancestor ``middleware.py``'s ``middleware``, root to leaf."""
+    chain = []
+    for module in route.load_segments(MIDDLEWARE_FILE):
+        middleware = getattr(module, "middleware", None)
+        if not inspect.iscoroutinefunction(middleware):
+            raise TypeError(
+                f"invalid `middleware` in {module.__file__}: expected "
+                f"`async def middleware(request, call_next)`, got {middleware!r}"
+            )
+        chain.append(middleware)
+    return chain
+
+
 def _add_route(app: Haumea, route: Route) -> None:
+    middleware = _middleware(route)
     module = route.load()
     include_in_schema = _include_in_schema(module, route)
     for method in HTTP_METHODS:
@@ -166,6 +183,7 @@ def _add_route(app: Haumea, route: Route) -> None:
                 handler,
                 methods=[method],
                 include_in_schema=include_in_schema,
+                middleware=middleware,
             )
 
 

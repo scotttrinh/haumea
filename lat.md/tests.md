@@ -70,6 +70,46 @@ Verify [[src/haumea/routing.py#load_module]] runs a segment file once when two s
 
 Verify [[src/haumea/routing.py#Route#load_segments]] loads only the route's own ancestor files, root to leaf, skipping a sibling directory's file and missing files, and that routes sharing an ancestor (including through a route group) reuse its module.
 
+## Middleware
+
+Exercise `middleware.py` chains ([[routing#Middleware]]); each request test runs against both [[src/haumea/routing.py#create_app]] and [[src/haumea/routing.py#create_route_app]] to prove parity.
+
+### Runs outer to inner
+
+Root, `(group)` and leaf middleware enter outermost first, the handler runs, and they exit in reverse; a sibling outside the group runs only the root's middleware.
+
+### Short-circuits
+
+A middleware that returns a response without calling `call_next` skips inner middleware and the handler; outer middleware still sees its response.
+
+### Sees the error response
+
+A handler's `HTTPException` 401 (with headers), a query `RequestValidationError` 422, and an unhandled 500 reach every middleware as a `Response` from `call_next`, which can still edit it.
+
+### Middleware errors get the default mapping
+
+`HTTPException`, `RequestValidationError` and other exceptions raised by middleware propagate past the outer middleware and become JSON 403 with headers, JSON 422, and plain-text 500.
+
+### Skips unmatched paths but runs on 405
+
+A 404 runs no middleware. A literal route's 405 runs its chain; a path matching two dynamic routes is the first one's 405 through its chain, as the platform's first rewrite would send it, not the later catch-all.
+
+### Skips dev files
+
+In `create_app`, `public_dir` files, `openapi.json`, and a docs 405 are served without running any middleware.
+
+### Invalid middleware
+
+A `middleware.py` with no `middleware`, a non-callable one, or a sync function makes both factories raise `TypeError` naming the file.
+
+### Non-response result
+
+A middleware that returns something other than a `Response` becomes a plain-text 500 under both factories.
+
+### Conflicting chains for one path
+
+Two route files with the same URL path but different ancestor middleware make `create_app` raise `ValueError` instead of picking one chain.
+
 ## Route module isolation
 
 Verify `app/route.py` in two projects loads two modules, and that `base_path = "/v1+"` keeps `app/route.py` and `app/!/route.py` apart: modules are keyed by file, not by the function path.

@@ -892,6 +892,286 @@ def test_segment_module_loading(tmp_path, isolated_imports):
         assert set(sys.modules) == before
 
 
+def middleware_source(name: str) -> str:
+    """Source for a ``middleware.py`` that records ``name>`` on the way in and
+    ``<name:status`` on the way out in ``mwlog.EVENTS``. ``x-stop: name``
+    short-circuits it with a 418; ``x-raise: name`` makes it raise
+    ``x-raise-kind`` (``http``, ``validation`` or anything else)."""
+    return (
+        "import mwlog\n"
+        "from haumea import HTTPException, JSONResponse, RequestValidationError\n\n"
+        "async def middleware(request, call_next):\n"
+        f"    mwlog.EVENTS.append({name + '>'!r})\n"
+        f"    if request.headers.get('x-stop') == {name!r}:\n"
+        f"        return JSONResponse({{'stopped': {name!r}}}, 418)\n"
+        f"    if request.headers.get('x-raise') == {name!r}:\n"
+        "        kind = request.headers.get('x-raise-kind')\n"
+        "        if kind == 'http':\n"
+        f"            raise HTTPException(403, {name!r}, {{'x-why': 'mw'}})\n"
+        "        if kind == 'validation':\n"
+        f"            raise RequestValidationError([{{'msg': {name!r}}}])\n"
+        f"        raise RuntimeError({name!r})\n"
+        "    response = await call_next(request)\n"
+        f"    mwlog.EVENTS.append(f'<{name}:{{response.status_code}}')\n"
+        f"    response.headers['x-seen-' + {name!r}] = str(response.status_code)\n"
+        "    return response\n"
+    )
+
+
+MIDDLEWARE_ROUTE = (
+    "import mwlog\n"
+    "from haumea import HTTPException\n\n"
+    "def GET(n: int = 0, fail: str = ''):\n"
+    "    mwlog.EVENTS.append('handler')\n"
+    "    if fail == '401':\n"
+    "        raise HTTPException(401, 'nope', {'www-authenticate': 'Bearer'})\n"
+    "    if fail == 'boom':\n"
+    "        raise RuntimeError('boom')\n"
+    "    return {'n': n}\n"
+)
+
+
+@pytest.fixture
+def middleware_project(tmp_path, isolated_imports):
+    """A project with root, ``(group)`` and leaf middleware, a sibling with
+    only the root's, and two dynamic routes that overlap on ``/items/x``.
+
+    Yields ``(serve, events)``. ``serve(factory, method, path)`` sends one
+    request to ``create_app`` (``factory="dev"``) or to the
+    ``create_route_app`` for ``function`` (``factory="route"``)."""
+    write_project(
+        tmp_path,
+        {
+            "mwlog.py": "EVENTS = []\n",
+            "app/middleware.py": middleware_source("root"),
+            "app/(group)/middleware.py": middleware_source("group"),
+            "app/(group)/admin/middleware.py": middleware_source("admin"),
+            "app/(group)/admin/route.py": MIDDLEWARE_ROUTE,
+            "app/public/route.py": MIDDLEWARE_ROUTE,
+            "app/items/[id]/middleware.py": middleware_source("id"),
+            "app/items/[id]/route.py": MIDDLEWARE_ROUTE,
+            "app/items/[...rest]/middleware.py": middleware_source("rest"),
+            "app/items/[...rest]/route.py": (
+                "def POST(rest: str):\n    return {'rest': rest}\n"
+            ),
+            "public/hello.txt": "static\n",
+        },
+    )
+    app_dir = tmp_path / "app"
+    dev = create_app(app_dir, public_dir=tmp_path / "public")
+    events: list[str] = sys.modules["mwlog"].EVENTS  # imported by middleware.py
+
+    def serve(
+        factory, method, path, function: str | None = None, **kwargs
+    ) -> httpx.Response:
+        if factory == "dev":
+            app = dev
+        else:
+            assert function is not None
+            app = create_route_app(app_dir, function)
+        events.clear()
+        return make_client(app)(method, path, **kwargs)
+
+    return serve, events
+
+
+FACTORIES = [
+    pytest.param("dev", id="create_app"),
+    pytest.param("route", id="create_route_app"),
+]
+
+
+# @lat: [[tests#Middleware#Runs outer to inner]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_order(middleware_project, factory):
+    serve, events = middleware_project
+    response = serve(factory, "GET", "/admin?n=3", function="admin")
+    assert response.json() == {"n": 3}
+    assert events == [
+        "root>",
+        "group>",
+        "admin>",
+        "handler",
+        "<admin:200",
+        "<group:200",
+        "<root:200",
+    ]
+    assert response.headers["x-seen-root"] == "200"
+
+    # A sibling outside the group runs only the root's middleware.
+    assert serve(factory, "GET", "/public", function="public").json() == {"n": 0}
+    assert events == ["root>", "handler", "<root:200"]
+
+
+# @lat: [[tests#Middleware#Short-circuits]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_short_circuit(middleware_project, factory):
+    serve, events = middleware_project
+    headers = {"x-stop": "group"}
+    response = serve(factory, "GET", "/admin", function="admin", headers=headers)
+    assert response.status_code == 418
+    assert response.json() == {"stopped": "group"}
+    assert events == ["root>", "group>", "<root:418"]  # no admin, no handler
+
+
+# @lat: [[tests#Middleware#Sees the error response]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_sees_error_response(middleware_project, factory):
+    serve, events = middleware_project
+    chain = ["root>", "group>", "admin>"]
+
+    response = serve(factory, "GET", "/admin?fail=401", function="admin")
+    assert response.status_code == 401
+    assert response.json() == {"detail": "nope"}
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.headers["x-seen-admin"] == "401"
+    assert events == [*chain, "handler", "<admin:401", "<group:401", "<root:401"]
+
+    response = serve(factory, "GET", "/admin?n=bad", function="admin")
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["query", "n"]
+    assert events == [*chain, "<admin:422", "<group:422", "<root:422"]
+
+    response = serve(factory, "GET", "/admin?fail=boom", function="admin")
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert response.headers["x-seen-root"] == "500"
+    assert events == [*chain, "handler", "<admin:500", "<group:500", "<root:500"]
+
+
+# @lat: [[tests#Middleware#Middleware errors get the default mapping]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_exception(middleware_project, factory):
+    serve, events = middleware_project
+
+    def raising(kind: str) -> httpx.Response:
+        headers = {"x-raise": "group", "x-raise-kind": kind}
+        return serve(factory, "GET", "/admin", function="admin", headers=headers)
+
+    response = raising("http")
+    assert response.status_code == 403
+    assert response.json() == {"detail": "group"}
+    assert response.headers["x-why"] == "mw"
+    assert events == ["root>", "group>"]  # propagates past the outer layers
+
+    response = raising("validation")
+    assert response.status_code == 422
+    assert response.json() == {"detail": [{"msg": "group"}]}
+
+    response = raising("other")
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert "x-seen-root" not in response.headers
+
+
+# @lat: [[tests#Middleware#Skips unmatched paths but runs on 405]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_unmatched_and_405(middleware_project, factory):
+    serve, events = middleware_project
+
+    # A literal route's 405 runs through its own chain.
+    response = serve(factory, "POST", "/admin", function="admin")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET"
+    assert response.headers["x-seen-admin"] == "405"
+    assert events == [
+        "root>",
+        "group>",
+        "admin>",
+        "<admin:405",
+        "<group:405",
+        "<root:405",
+    ]
+
+    # /items/x matches [id] first, as the platform's first rewrite would, so
+    # POST is that function's 405 rather than the catch-all's handler.
+    response = serve(factory, "POST", "/items/x", function="items/[id]")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET"
+    assert events == ["root>", "id>", "<id:405", "<root:405"]
+    response = serve(factory, "POST", "/items/x/y", function="items/[...rest]")
+    assert response.json() == {"rest": "x/y"}
+    assert events == ["root>", "rest>", "<rest:200", "<root:200"]
+
+    # No route, no segment files.
+    response = serve(factory, "GET", "/nope", function="admin")
+    assert response.status_code == 404
+    assert events == []
+
+
+# @lat: [[tests#Middleware#Skips dev files]]
+def test_middleware_skips_dev_files(middleware_project):
+    serve, events = middleware_project
+    assert serve("dev", "GET", "/hello.txt").text == "static\n"
+    assert serve("dev", "GET", "/openapi.json").json()["openapi"] == "3.1.0"
+    assert serve("dev", "POST", "/docs").status_code == 405
+    assert events == []
+
+
+# @lat: [[tests#Middleware#Invalid middleware]]
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = 1\n",
+        "middleware = 1\n",
+        "def middleware(request, call_next):\n    return call_next(request)\n",
+    ],
+)
+def test_invalid_middleware(tmp_path, isolated_imports, source):
+    write_project(
+        tmp_path,
+        {
+            "app/(group)/middleware.py": source,
+            "app/(group)/a/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    file = (tmp_path / "app" / "(group)" / "middleware.py").resolve()
+    for make_app in [
+        lambda: create_app(tmp_path / "app"),
+        lambda: create_route_app(tmp_path / "app", "a"),
+    ]:
+        with pytest.raises(TypeError, match=re.escape(str(file))):
+            make_app()
+
+
+# @lat: [[tests#Middleware#Non-response result]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_middleware_non_response(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/middleware.py": (
+                "async def middleware(request, call_next):\n"
+                "    await call_next(request)\n"
+                "    return {'not': 'a response'}\n"
+            ),
+            "app/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir) if factory == "dev" else create_route_app(app_dir, "index")
+    )
+    response = make_client(app)("GET", "/")
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+
+
+# @lat: [[tests#Middleware#Conflicting chains for one path]]
+def test_middleware_conflicting_chains(tmp_path, isolated_imports):
+    middleware = "async def middleware(request, call_next):\n    return None\n"
+    write_project(
+        tmp_path,
+        {
+            "app/(a)/middleware.py": middleware,
+            "app/(a)/x/route.py": "def GET():\n    return {}\n",
+            "app/(b)/x/route.py": "def POST():\n    return {}\n",
+        },
+    )
+    with pytest.raises(ValueError, match="conflicting middleware for route '/x'"):
+        create_app(tmp_path / "app")
+
+
 # @lat: [[tests#Route module isolation]]
 def test_route_module_isolation(tmp_path, isolated_imports):
     for name in ["one", "two"]:

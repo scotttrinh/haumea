@@ -4,7 +4,7 @@ import mimetypes
 import re
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,33 @@ from haumea.requests import Receive, Request, Scope, Send
 from haumea.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
+
+CallNext = Callable[[Request], Awaitable[Response]]
+Middleware = Callable[[Request, CallNext], Awaitable[Response]]
+
+
+def error_response(exc: Exception) -> Response:
+    """The default mapping: ``HTTPException`` -> JSON, ``RequestValidationError``
+    -> JSON 422, anything else is logged and becomes a plain-text 500."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse({"detail": exc.detail}, exc.status_code, exc.headers)
+    if isinstance(exc, RequestValidationError):
+        return JSONResponse({"detail": exc.errors}, 422)
+    traceback.print_exception(exc, file=sys.stderr)
+    return PlainTextResponse("Internal Server Error", 500)
+
+
+def _wrap(middleware: Middleware, call_next: CallNext) -> CallNext:
+    async def call(request: Request) -> Response:
+        response = await middleware(request, call_next)
+        if not isinstance(response, Response):
+            raise TypeError(
+                f"middleware {middleware.__module__}.{middleware.__qualname__} "
+                f"returned {response!r}, not a Response"
+            )
+        return response
+
+    return call
 
 
 def _compile_path(path: str) -> re.Pattern[str]:
@@ -54,6 +81,8 @@ class Haumea:
         self.routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]] = []
         self.hidden_operations: set[tuple[str, str]] = set()
         """``(path, method)`` pairs served but left out of the OpenAPI schema."""
+        self.middleware: dict[str, tuple[Middleware, ...]] = {}
+        """Each path's middleware chain, outermost first."""
 
     def add_route(
         self,
@@ -62,14 +91,22 @@ class Haumea:
         methods: list[str],
         *,
         include_in_schema: bool = True,
+        middleware: Sequence[Middleware] = (),
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
-        serves it without documenting it in OpenAPI."""
+        serves it without documenting it in OpenAPI.
+
+        ``middleware`` wraps every method of ``path``, outermost first, so
+        each call for one path must pass the same chain."""
         endpoint = Endpoint(handler, {m[1] for m in _PATH_PARAM.finditer(path)})
         endpoints = next((e for p, _, e in self.routes if p == path), None)
+        chain = tuple(middleware)
         if endpoints is None:
             endpoints = {}
             self.routes.append((path, _compile_path(path), endpoints))
+            self.middleware[path] = chain
+        elif self.middleware[path] != chain:
+            raise ValueError(f"conflicting middleware for route {path!r}")
         for method in map(str.upper, methods):
             endpoints[method] = endpoint
             if include_in_schema:
@@ -93,15 +130,8 @@ class Haumea:
         request = Request(scope, receive)
         try:
             response = await self._handle(request)
-        except HTTPException as exc:
-            response = JSONResponse(
-                {"detail": exc.detail}, exc.status_code, exc.headers
-            )
-        except RequestValidationError as exc:
-            response = JSONResponse({"detail": exc.errors}, 422)
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
-            response = PlainTextResponse("Internal Server Error", 500)
+        except Exception as exc:  # unmatched paths and middleware errors
+            response = error_response(exc)
         await response(receive, send, include_body=request.method != "HEAD")
 
     async def _handle(self, request: Request) -> Response:
@@ -122,26 +152,39 @@ class Haumea:
         request: Request,
         routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]],
     ) -> Response | None:
-        """Call the first of ``routes`` matching the path and method; raise
-        ``405`` if one or more matched the path regex but none supported the
-        request method."""
-        method = "GET" if request.method == "HEAD" else request.method
-        allowed: set[str] = set()
-        for _, pattern, endpoints in routes:
-            match = pattern.fullmatch(request.path)
-            if not match:
-                continue
-            endpoint = endpoints.get(request.method) or endpoints.get(method)
-            if endpoint is None:
-                allowed.update(endpoints)
-                continue
-            request.path_params = match.groupdict()
-            result = await endpoint.call(request)
-            return result if isinstance(result, Response) else JSONResponse(result)
-        if allowed:
-            headers = {"allow": ", ".join(sorted(allowed))}
-            raise HTTPException(405, "Method Not Allowed", headers)
+        """Serve the request with the first of ``routes`` whose regex matches
+        the path, as the platform sends it to that route's function, or
+        return None if none matches.
+
+        The route's middleware wraps its endpoint, or the ``405`` when no
+        endpoint supports the method. Inside the innermost middleware,
+        endpoint errors already become their default ``Response``."""
+        for path, pattern, endpoints in routes:
+            if match := pattern.fullmatch(request.path):
+                request.path_params = match.groupdict()
+                call = self._endpoint_call(endpoints)
+                for middleware in reversed(self.middleware.get(path, ())):
+                    call = _wrap(middleware, call)
+                return await call(request)
         return None
+
+    @staticmethod
+    def _endpoint_call(endpoints: dict[str, Endpoint]) -> CallNext:
+        async def call(request: Request) -> Response:
+            method = "GET" if request.method == "HEAD" else request.method
+            endpoint = endpoints.get(request.method) or endpoints.get(method)
+            try:
+                if endpoint is None:
+                    headers = {"allow": ", ".join(sorted(endpoints))}
+                    raise HTTPException(405, "Method Not Allowed", headers)
+                result = await endpoint.call(request)
+                if isinstance(result, Response):
+                    return result
+                return JSONResponse(result)
+            except Exception as exc:
+                return error_response(exc)
+
+        return call
 
     def _dev_file(self, request: Request) -> Response | None:
         """The docs, ``openapi.json`` or a ``public_dir`` file at the path,
