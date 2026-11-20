@@ -25,6 +25,7 @@ from haumea import (
     Geo,
     Haumea,
     HaumeaConfig,
+    HTTPBearer,
     JSONResponse,
     Request,
     Response,
@@ -35,6 +36,7 @@ from haumea import (
     create_route_app,
     lazy,
     load_config,
+    raises,
 )
 from haumea import build as build_module
 from haumea import params as params_module
@@ -150,10 +152,11 @@ def test_body_and_dependencies(client):
     assert client("PUT", "/api/items/7", json=item, headers=AUTH).json() == item
 
     response = client("PUT", "/api/items/7", json=item)
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["header", "authorization"]
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
 
-    response = client("PUT", "/api/items/7", json=item, headers={"Authorization": "x"})
+    headers = {"Authorization": "Bearer wrong"}
+    response = client("PUT", "/api/items/7", json=item, headers=headers)
     assert response.status_code == 401
     assert response.json() == {"detail": "Not authenticated"}
 
@@ -168,10 +171,15 @@ def test_dev_docs_and_static_files(client, example_app):
     schema = client("GET", "/openapi.json").json()
     put = schema["paths"]["/api/items/{item_id}"]["put"]
     assert put["summary"] == "Replace an item. Requires `Authorization: Bearer secret`."
-    assert {(p["name"], p["in"]) for p in put["parameters"]} == {
-        ("item_id", "path"),
-        ("authorization", "header"),
+    # The bearer credential is a security scheme, not a header parameter.
+    assert [(p["name"], p["in"]) for p in put["parameters"]] == [("item_id", "path")]
+    assert put["security"] == [{"HTTPBearer": []}]
+    assert schema["components"]["securitySchemes"] == {
+        "HTTPBearer": {"type": "http", "scheme": "bearer"}
     }
+    assert list(put["responses"]) == ["200", "401", "422"]
+    assert put["responses"]["401"] == {"description": "Not authenticated"}
+    assert "security" not in schema["paths"]["/api/items/{item_id}"]["get"]
     ref = {"$ref": "#/components/schemas/Item"}
     assert put["requestBody"]["content"]["application/json"]["schema"] == ref
     assert put["responses"]["200"]["content"]["application/json"]["schema"] == ref
@@ -3532,3 +3540,215 @@ def test_lazy_abandoned_waiter_after_failure(caplog):
     asyncio.run(main())
     gc.collect()
     assert asyncio_errors(caplog) == []
+
+
+SECURE_ITEMS = """\
+from haumea import Depends, HTTPBearer, HTTPException, raises
+
+bearer = HTTPBearer()
+
+
+@raises(401, "Invalid token")
+def current_user(token: str = Depends(bearer)) -> str:
+    if token != "secret":
+        raise HTTPException(401, "Invalid token")
+    return "scott"
+
+
+def GET() -> list[str]:
+    return ["public"]
+
+
+@raises(403, "Not allowed")
+def POST(name: str, user: str = Depends(current_user)) -> str:
+    return f"{user}:{name}"
+"""
+
+
+# @lat: [[tests#Explicit security and responses]]
+def test_explicit_security_and_responses(tmp_path, isolated_imports):
+    project = tmp_path / "secure"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "secure"\nversion = "0"\n',
+            "app/items/route.py": SECURE_ITEMS,
+            "app/broken/route.py": (
+                "from haumea import Depends, HTTPBearer\n\n"
+                "def explode(token: str = Depends(HTTPBearer())) -> str:\n"
+                "    raise RuntimeError('called during schema generation')\n\n"
+                "def GET(value: str = Depends(explode)) -> str:\n"
+                "    return value\n"
+            ),
+            "app/internal/route.py": (
+                "from haumea import Depends, HTTPBearer, raises\n\n"
+                "include_in_schema = False\n\n"
+                "@raises(401, 'Internal only')\n"
+                "def GET(token: str = Depends(HTTPBearer('internal'))) -> str:\n"
+                "    return token\n"
+            ),
+        },
+    )
+    client = make_client(create_app(project / "app"))
+    schema = client("GET", "/openapi.json").json()
+
+    assert schema["components"] == {
+        "securitySchemes": {"HTTPBearer": {"type": "http", "scheme": "bearer"}}
+    }
+    items = schema["paths"]["/items"]
+    assert "security" not in items["get"]
+    assert list(items["get"]["responses"]) == ["200"]
+
+    post = items["post"]
+    assert post["security"] == [{"HTTPBearer": []}]
+    assert [(p["name"], p["in"]) for p in post["parameters"]] == [("name", "query")]
+    assert {code: r["description"] for code, r in post["responses"].items()} == {
+        "200": "Successful Response",
+        "401": "Invalid token",
+        "403": "Not allowed",
+        "422": "Validation Error",
+    }
+
+    # Declarations are read, not executed: the raising dependency is
+    # documented, and its scheme's runtime 401 is not, since it is undeclared.
+    broken = schema["paths"]["/broken"]["get"]
+    assert broken["security"] == [{"HTTPBearer": []}]
+    assert list(broken["responses"]) == ["200"]
+    assert "internal" not in json.dumps(schema)
+
+    static = {f.path: f.content for f in plan_build(project).static_files}
+    built = json.loads(static["openapi.json"])
+    assert (built["paths"], built["components"]) == (
+        schema["paths"],
+        schema["components"],
+    )
+
+    assert client("GET", "/items").json() == ["public"]
+    ok = client("POST", "/items?name=x", headers={"Authorization": "Bearer secret"})
+    assert ok.json() == "scott:x"
+    wrong = client("POST", "/items?name=x", headers={"Authorization": "Bearer no"})
+    assert (wrong.status_code, wrong.json()) == (401, {"detail": "Invalid token"})
+
+
+# @lat: [[tests#HTTP bearer credentials]]
+@pytest.mark.parametrize(
+    ("authorization", "token"),
+    [
+        (None, None),
+        ("", None),
+        ("Bearer", None),
+        ("Bearer ", None),
+        ("Basic dXNlcjpwYXNz", None),
+        ("Bearertoken", None),
+        ("Bearer abc.def", "abc.def"),
+        ("bearer abc", "abc"),
+        ("BEARER  abc ", "abc"),
+    ],
+)
+def test_http_bearer_credentials(authorization, token):
+    app = Haumea(docs=False)
+    bearer = HTTPBearer()
+
+    def handler(value: str = Depends(bearer)) -> str:
+        return value
+
+    app.add_route("/", handler, methods=["GET"])
+    headers = {} if authorization is None else {"Authorization": authorization}
+    response = make_client(app)("GET", "/", headers=headers)
+    if token is None:
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Not authenticated"}
+        assert response.headers["www-authenticate"] == "Bearer"
+    else:
+        assert response.json() == token
+
+
+# @lat: [[tests#Declared responses must be errors]]
+@pytest.mark.parametrize("status", [200, 204, 399, 600])
+def test_raises_rejects_non_error_statuses(status):
+    with pytest.raises(ValueError, match="status"):
+        raises(status, "nope")
+
+
+def declared_descriptions(handler) -> dict[str, str]:
+    app = Haumea()
+    app.add_route("/", handler, methods=["GET"])
+    responses = app.openapi()["paths"]["/"]["get"]["responses"]
+    return {code: r["description"] for code, r in responses.items()}
+
+
+# @lat: [[tests#Declared response precedence]]
+def test_declared_response_precedence():
+    @raises(401, "outer")
+    @raises(401, "inner")
+    @raises(403, "only")
+    def stacked() -> None:
+        return None
+
+    assert declared_descriptions(stacked) == {
+        "200": "Successful Response",
+        "401": "outer",
+        "403": "only",
+    }
+
+    @raises(401, "nested")
+    @raises(403, "nested")
+    @raises(404, "nested")
+    def nested() -> None:
+        return None
+
+    def first(value: None = Depends(nested)) -> None:
+        return value
+
+    @raises(401, "direct")
+    @raises(403, "direct")
+    def second() -> None:
+        return None
+
+    @raises(403, "handler")
+    def handler(a: None = Depends(first), b: None = Depends(second)) -> None:
+        return None
+
+    # The handler beats its dependencies, and a direct dependency beats a
+    # nested one even when the nested one is in an earlier parameter.
+    assert declared_descriptions(handler) == {
+        "200": "Successful Response",
+        "401": "direct",
+        "403": "handler",
+        "404": "nested",
+    }
+
+
+# @lat: [[tests#Declared response statuses must be integers]]
+@pytest.mark.parametrize("status", [401.5, "401", True, None])
+def test_raises_rejects_non_integer_statuses(status):
+    with pytest.raises(TypeError, match="status"):
+        raises(status, "nope")
+
+
+# @lat: [[tests#HTTP bearer scheme names]]
+@pytest.mark.parametrize(
+    ("name", "valid"),
+    [
+        ("HTTPBearer", True),
+        ("api.v1-token_2", True),
+        ("", False),
+        ("my bearer", False),
+        ("a/b", False),
+        ("tokén", False),
+        ("a:b", False),
+    ],
+)
+def test_http_bearer_scheme_names(name, valid):
+    if not valid:
+        with pytest.raises(ValueError, match="name"):
+            HTTPBearer(name)
+        return
+    bearer = HTTPBearer(name)
+
+    def handler(token: str = Depends(bearer)) -> str:
+        return token
+
+    app = Haumea()
+    app.add_route("/", handler, methods=["GET"])
+    assert list(app.openapi()["components"]["securitySchemes"]) == [name]

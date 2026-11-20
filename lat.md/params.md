@@ -27,6 +27,16 @@ Haumea infers each handler parameter's source, coercion rules, and dependencies 
 
 Dependencies are cached in a per-request dictionary keyed by `field.dependency.func`, so a shared dependency runs at most once per request. Async handlers and dependencies are awaited directly; synchronous ones run via `asyncio.to_thread`.
 
+## Security and Declared Responses
+
+Dependencies declare a credential scheme with [[src/haumea/security.py#HTTPBearer]], and handlers or dependencies declare documented error responses with [[src/haumea/params.py#raises]].
+
+- **Bearer credentials**: an `HTTPBearer` instance is an ordinary dependency (`token: str = Depends(bearer)`). Its `name` must match [[src/haumea/security.py#_COMPONENT_NAME]], the OpenAPI component-name pattern, or the constructor raises `ValueError`. [[src/haumea/security.py#HTTPBearer#__call__]] takes the raw [[src/haumea/requests.py#Request]], so it adds no `authorization` header parameter. It splits `Authorization` on its first space, matches `Bearer` case-insensitively, strips the token, and raises `401` `Not authenticated` with `WWW-Authenticate: Bearer` when the scheme or token is missing.
+- **Declared responses**: `@raises(status, description)` stores `{status: description}` on the function and only documents; code still raises [[src/haumea/exceptions.py#HTTPException]]. It raises `TypeError` for a non-`int` (or `bool`) status and `ValueError` outside `400`–`599`. Stacked decorators repeating a status keep the outermost description.
+- **Traversal**: [[src/haumea/params.py#Endpoint#security_schemes]] yields every `HTTPBearer` in the dependency tree, and [[src/haumea/params.py#Endpoint#declared_responses]] merges `raises` declarations breadth-first, keeping the first description per status: the handler, then its direct dependencies in parameter order, then theirs. A handler beats its dependencies, and a direct dependency beats a nested one in an earlier parameter. Both read the signatures already parsed by [[src/haumea/params.py#Endpoint]] and never call a dependency, so a dependency that raises still permits schema generation.
+
+[[src/haumea/openapi.py#_operation]] turns these into OpenAPI ([[build#Static Docs and Routing Config]]).
+
 ## Validation Errors
 
 All conversion and decoding failures are collected into a list of `{"loc": [...], "msg": ...}` dictionaries and raised as [[src/haumea/exceptions.py#RequestValidationError]] (`422`).

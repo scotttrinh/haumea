@@ -2,7 +2,7 @@ from typing import Annotated
 
 from msgspec import Meta, Struct
 
-from haumea import Depends, Header, HTTPException
+from haumea import Depends, HTTPBearer, HTTPException, raises
 
 # Per-function settings, like Next.js route segment config.
 max_duration = 10
@@ -13,8 +13,12 @@ class Item(Struct):
     price: Annotated[float, Meta(gt=0)]
 
 
-def current_user(authorization: str = Header()) -> str:
-    if authorization != "Bearer secret":
+bearer = HTTPBearer()
+
+
+@raises(401, "Not authenticated")
+def current_user(token: str = Depends(bearer)) -> str:
+    if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "scott"
 

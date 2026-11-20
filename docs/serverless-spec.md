@@ -357,11 +357,14 @@ A module-level `include_in_schema = False` in `route.py` leaves the route's oper
 
 ### 6.7 Explicit OpenAPI security and responses
 
-The current generator walks the declared request fields of a handler and its dependencies. For example, the hello project's `PUT` operation currently emits an ordinary `authorization` header and documents `200` and `422`, even though its dependency can raise `401`.
+The generator walks the declared request fields of a handler and its dependencies. On its own, that walk documents a credential read with `Header()` as an ordinary `authorization` header and documents only `200` and `422`, even when a dependency can raise `401`. The hello project's `PUT` uses the declarations below instead.
 
 Security documentation needs an explicit declaration of the credential scheme. For a declared HTTP bearer scheme, emit one entry in `components.securitySchemes` and reference it in each affected operation's `security` list. Represent its credential there only. OpenAPI reserves the `Authorization` header for this purpose. Document `401` and `403` when explicitly declared. A bearer scheme describes how to present credentials. Application code still decides whether the caller may perform the operation.
 
-This feature applies to ordinary handler dependencies independently of inheritance. Schema generation reads declarations without executing checks or inspecting function bodies for exceptions. The Python spelling of these declarations remains open (§9).
+This feature applies to ordinary handler dependencies independently of inheritance. Schema generation reads declarations without executing checks or inspecting function bodies for exceptions.
+
+- **Credential scheme.** `HTTPBearer(name="HTTPBearer")` is a dependency; `name` must be an OpenAPI component name (`[a-zA-Z0-9._-]+`) or the constructor raises `ValueError`. It is used as `token: str = Depends(bearer)`. It returns the token from `Authorization: Bearer <token>` and raises `401` with `WWW-Authenticate: Bearer` when the credential is missing or uses another scheme. Every documented operation whose handler or dependencies use it lists `{name: []}` in `security`; several schemes in one operation share one requirement object, since every dependency runs. `components.securitySchemes[name]` is `{"type": "http", "scheme": "bearer"}`, collected only from documented operations (§6.4).
+- **Documented responses.** `@raises(status, description)` on a handler or dependency adds `{"description": ...}` under that status for every operation using it. Stack it for several statuses. It accepts only an `int` from `400` to `599`, and generated `200` and `422` responses keep their own content. When a status is declared more than once, the outermost declaration wins: among stacked decorators the outermost one, and across the dependency tree the nearest level (the handler, then its direct dependencies in parameter order, then theirs). `HTTPBearer`'s own `401` is documented only when a `raises(401, ...)` declares it.
 
 ---
 
@@ -438,4 +441,4 @@ These items stay in [serverless-design.md](serverless-design.md):
 2. **`uv export --package` in a workspace.** *Resolved in 1.5 (`uv` 0.11.23).* `--package <name> --no-emit-project` drops only `<name>` (even when `<name>` has a `[build-system]`), keeps workspace sibling dependencies such as `./packages/core`, and omits unrelated workspace members and their dependencies (`test_workspace_build`). Verified manually with `uv` 0.11.23 that a non-virtual workspace root package is also kept when depended on by `<name>` and dropped when exported as `<name>`.
 3. **`vercel-functions` import path.** Does the split package keep the `vercel.functions` import path? Check when it is published.
 4. **Segment dependency declaration.** Choose the segment filename and exported collection for §7.5 before implementing plan step 4.5. Keep route authorship in `route.py`.
-5. **Operation metadata.** Choose how a dependency declares a credential scheme and how an operation or dependency declares documented responses (§6.7). Broader defaults such as subtree tags and method-specific success responses remain open.
+5. **Operation metadata.** *Resolved in 3.6: `Depends(HTTPBearer())` declares a credential scheme and `@raises(status, description)` declares a documented response on a handler or dependency (§6.7).* Broader defaults such as subtree tags and method-specific success responses remain open.

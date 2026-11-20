@@ -42,7 +42,11 @@ def _schema(annotation: Any, components: dict[str, Any]) -> dict[str, Any]:
 
 
 def _operation(
-    method: str, path: str, endpoint: Endpoint, components: dict[str, Any]
+    method: str,
+    path: str,
+    endpoint: Endpoint,
+    components: dict[str, Any],
+    security_schemes: dict[str, Any],
 ) -> dict[str, Any]:
     doc = inspect.getdoc(endpoint.func) or ""
     operation: dict[str, Any] = {
@@ -88,20 +92,34 @@ def _operation(
         success["content"] = {
             "application/json": {"schema": _schema(returns, components)}
         }
-    operation["responses"] = {"200": success}
+    responses: dict[int, Any] = {200: success}
     if fields:
-        operation["responses"]["422"] = _VALIDATION_ERROR
+        responses[422] = _VALIDATION_ERROR
+    for status, description in endpoint.declared_responses().items():
+        responses.setdefault(status, {"description": description})
+    operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
+
+    # All dependencies run, so every scheme is required together: one
+    # requirement object naming each of them.
+    schemes = {scheme.name: scheme for scheme in endpoint.security_schemes()}
+    if schemes:
+        operation["security"] = [{name: [] for name in schemes}]
+        for name, scheme in schemes.items():
+            security_schemes[name] = scheme.openapi()
     return operation
 
 
 def openapi_schema(app: Haumea) -> dict[str, Any]:
     components: dict[str, Any] = {}
+    security_schemes: dict[str, Any] = {}
     paths: dict[str, Any] = {}
     for path, _, endpoints in app.routes:
         # Components are collected only from documented operations, so a
-        # schema used solely by hidden ones is left out too.
+        # schema or scheme used solely by hidden ones is left out too.
         operations = {
-            method.lower(): _operation(method, path, endpoint, components)
+            method.lower(): _operation(
+                method, path, endpoint, components, security_schemes
+            )
             for method, endpoint in endpoints.items()
             if (path, method) not in app.hidden_operations
         }
@@ -114,6 +132,8 @@ def openapi_schema(app: Haumea) -> dict[str, Any]:
     }
     if components:
         schema["components"] = {"schemas": components}
+    if security_schemes:
+        schema.setdefault("components", {})["securitySchemes"] = security_schemes
     return schema
 
 

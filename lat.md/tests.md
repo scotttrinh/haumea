@@ -16,11 +16,13 @@ Verify `422` `RequestValidationError` responses and `loc` paths for invalid path
 
 ## Body and dependencies
 
-Verify JSON body decoding alongside `Depends` and `Header` resolution, missing header `422` errors, and `HTTPException` `401` propagation.
+Verify JSON body decoding alongside `Depends` and `HTTPBearer` resolution, a missing credential's `401` with `WWW-Authenticate: Bearer`, and a wrong token's `HTTPException` `401`.
 
 ## Dev docs and static files
 
 Verify `public/` static file serving, raw-scope path traversal and trailing-slash rejection (`404`), `/docs` Swagger UI, and `/openapi.json` schema generation including summaries, parameters, `$ref` schemas, and `Meta` constraints.
+
+It also checks the hello `PUT`'s bearer `security` and declared `401`, with no `authorization` header parameter and no `security` on the public `GET`.
 
 ## Project config
 
@@ -263,6 +265,32 @@ Verify that when every route is hidden, `openapi.json` has empty `paths` and no 
 ## Invalid include_in_schema
 
 Verify a non-`bool` `include_in_schema` (a string, `0` or `None`) fails app creation with a `TypeError` naming the setting, instead of being read as truthy or falsy.
+
+## Explicit security and responses
+
+Verify a protected operation references one `HTTPBearer` scheme in `security` with no credential header parameter, a public sibling has no `security`, and only `raises`-declared `401`/`403` join `200`/`422`.
+
+The same project checks that a dependency raising if called still documents its scheme, that a hidden protected route leaks no scheme into `components.securitySchemes`, that the build's static `openapi.json` matches dev, and that the protected route enforces its token.
+
+## HTTP bearer credentials
+
+Verify `HTTPBearer` returns the stripped token for a case-insensitive `Bearer` credential and answers missing, empty, malformed or non-bearer credentials with `401` and `WWW-Authenticate: Bearer`.
+
+## HTTP bearer scheme names
+
+Verify `HTTPBearer` names outside the OpenAPI component-name pattern (empty, spaces, `/`, `:`, non-ASCII) raise `ValueError` at declaration, while valid names become `components.securitySchemes` keys.
+
+## Declared response precedence
+
+Verify through the generated schema that the outermost stacked `raises` wins, a handler beats its dependencies, and a direct dependency beats a nested one in an earlier parameter.
+
+## Declared responses must be errors
+
+Verify `raises` rejects success, redirect-boundary and out-of-range statuses with `ValueError`, so only error responses can be declared.
+
+## Declared response statuses must be integers
+
+Verify `raises` rejects non-`int` statuses (`401.5`, `"401"`, `True`, `None`) with `TypeError`, so a response key such as `"401.5"` never reaches the schema.
 
 ## Lazy values
 

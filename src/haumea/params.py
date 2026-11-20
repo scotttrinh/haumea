@@ -8,6 +8,7 @@
 
 ``Query()``, ``Header()``, ``Cookie()`` and ``Body()`` override the inferred source.
 ``lazy(factory)`` makes a process-wide value usable as ``Depends(...)``.
+``@raises(status, description)`` documents an error response in OpenAPI.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import msgspec
 
 from haumea.exceptions import RequestValidationError
 from haumea.requests import Request
+from haumea.security import HTTPBearer
 
 _MISSING: Any = object()
 
@@ -48,6 +50,33 @@ class ParamInfo:
 
 def Depends(dependency: Callable[..., Any]) -> Any:
     return DependsInfo(dependency)
+
+
+_RAISES = "__haumea_raises__"
+
+
+def raises[F: Callable[..., Any]](
+    status_code: int, description: str
+) -> Callable[[F], F]:
+    """Document that a handler or dependency may respond with an error.
+
+    ``@raises(401, "Not authenticated")`` adds that response to every
+    operation using the decorated function. Stack it for several statuses.
+    It only documents: raise ``HTTPException`` to send the response. When
+    stacked decorators repeat a status, the outermost one wins.
+    """
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        raise TypeError(f"raises() takes an int status code, got {status_code!r}")
+    if not 400 <= status_code <= 599:
+        raise ValueError(f"raises() takes an error status code, got {status_code}")
+
+    def decorate(func: F) -> F:
+        # Decorators apply inner first, so the outer one overwrites.
+        declared = getattr(func, _RAISES, {})
+        setattr(func, _RAISES, {**declared, status_code: description})
+        return func
+
+    return decorate
 
 
 def Query(default: Any = ..., *, alias: str | None = None) -> Any:
@@ -210,6 +239,30 @@ class Endpoint:
                 yield from field.dependency.request_fields()
             elif field.source != "request":
                 yield field
+
+    def security_schemes(self) -> Iterator[HTTPBearer]:
+        """Every credential scheme this endpoint or its dependencies use."""
+        if isinstance(self.func, HTTPBearer):
+            yield self.func
+        for field in self.fields:
+            if field.dependency:
+                yield from field.dependency.security_schemes()
+
+    def declared_responses(self) -> dict[int, str]:
+        """Error responses declared with ``raises``, here and in dependencies.
+
+        The first declaration of a status wins, visiting level by level: this
+        function, then its direct dependencies in parameter order, then
+        theirs. A nearer declaration so beats a deeper one in any branch.
+        """
+        declared: dict[int, str] = {}
+        level: list[Endpoint] = [self]
+        while level:
+            for endpoint in level:
+                for status, description in getattr(endpoint.func, _RAISES, {}).items():
+                    declared.setdefault(status, description)
+            level = [f.dependency for e in level for f in e.fields if f.dependency]
+        return declared
 
     async def call(self, request: Request) -> Any:
         errors: list[dict[str, Any]] = []

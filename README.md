@@ -24,7 +24,7 @@ public/                           ->  static files
 # app/api/items/[item_id]/route.py
 from typing import Annotated
 
-from haumea import Depends, Header, HTTPException
+from haumea import Depends, HTTPBearer, HTTPException, raises
 from msgspec import Meta, Struct
 
 
@@ -33,8 +33,12 @@ class Item(Struct):
     price: Annotated[float, Meta(gt=0)]
 
 
-def current_user(authorization: str = Header()) -> str:
-    if authorization != "Bearer secret":
+bearer = HTTPBearer()
+
+
+@raises(401, "Not authenticated")
+def current_user(token: str = Depends(bearer)) -> str:
+    if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "scott"
 
@@ -58,6 +62,11 @@ A handler's signature declares its inputs, which are validated with
 - a `Request` annotation receives the raw request
 - anything else is a query parameter; `Query()`, `Header()` and `Body()`
   override the default
+
+`Depends(HTTPBearer())` returns the token from `Authorization: Bearer <token>`
+(or responds `401`) and documents an HTTP bearer security scheme in
+`openapi.json`. `@raises(401, "Not authenticated")` on a handler or dependency
+documents an error response for every operation using it.
 
 Handlers can be sync or async, and return JSON-serializable data or a
 `Response`.
