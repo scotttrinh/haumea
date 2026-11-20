@@ -110,6 +110,42 @@ A middleware that returns something other than a `Response` becomes a plain-text
 
 Two route files with the same URL path but different ancestor middleware make `create_app` raise `ValueError` instead of picking one chain.
 
+## Error boundaries
+
+Exercise `error.py` chains ([[routing#Error Boundaries]]) with sync root and leaf handlers and an async `(group)` handler; request tests run against both factories to prove parity.
+
+### Nearest error.py wins
+
+The leaf-most `handle_error` (sync for `/admin`, async for `/other`, root for `/plain`) handles a handler error, a 422 and a 405; middleware sees its response, and successful requests skip it.
+
+### Re-raising passes to the next ancestor
+
+A bare `raise` passes the same exception to the next ancestor, a new exception replaces it even through a later bare `raise` (sync or async), and past the root the default mapping renders the last exception.
+
+### Unhandled errors get the default mapping
+
+When every `error.py` re-raises the result is a plain-text 500 seen by middleware; a project without `error.py` keeps the JSON 401 with headers, 422, and plain-text 500.
+
+### Middleware errors skip error.py
+
+Exceptions raised by middleware get the default 500, 403 and 422 without running any `handle_error`, and a 404 runs no segment file.
+
+### Non-response result
+
+A `handle_error` returning `None` passes a `TypeError` to the next ancestor; if every handler does, the result is a plain-text 500.
+
+### Awaitable handlers
+
+A `handle_error` instance with `async def __call__` and a sync wrapper returning a coroutine both handle the error at the nearest boundary without unawaited-coroutine warnings, and a bare `raise` in the awaited body reaches the ancestor.
+
+### Invalid error.py
+
+An `error.py` with no `handle_error` or a non-callable one makes both factories raise `TypeError` naming the file.
+
+### Conflicting error.py for one path
+
+Two route files with the same URL path but different ancestor `error.py` chains make `create_app` raise `ValueError`.
+
 ## Route module isolation
 
 Verify `app/route.py` in two projects loads two modules, and that `base_path = "/v1+"` keeps `app/route.py` and `app/!/route.py` apart: modules are keyed by file, not by the function path.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import mimetypes
 import re
 import sys
@@ -19,6 +21,7 @@ _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 
 CallNext = Callable[[Request], Awaitable[Response]]
 Middleware = Callable[[Request, CallNext], Awaitable[Response]]
+ErrorHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
 
 
 def error_response(exc: Exception) -> Response:
@@ -30,6 +33,58 @@ def error_response(exc: Exception) -> Response:
         return JSONResponse({"detail": exc.errors}, 422)
     traceback.print_exception(exc, file=sys.stderr)
     return PlainTextResponse("Internal Server Error", 500)
+
+
+def _call_sync_handler(handler: ErrorHandler, request: Request, exc: Exception) -> Any:
+    """Run a sync ``handle_error`` with ``exc`` active, so a bare ``raise``
+    in a worker thread re-raises it, and its traceback left as it was."""
+    tb = exc.__traceback__
+    try:
+        raise exc
+    except Exception:
+        exc.__traceback__ = tb
+        return handler(request, exc)
+
+
+def _is_async(handler: ErrorHandler) -> bool:
+    """An ``async def`` function or an instance with ``async def __call__``."""
+    return inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
+        type(handler).__call__
+    )
+
+
+async def _error_boundary(
+    handlers: Sequence[ErrorHandler], request: Request, exc: Exception
+) -> Response:
+    """Hand ``exc`` to the nearest of ``handlers`` (root to leaf). Whatever
+    it raises, including a non-``Response`` result as ``TypeError``, goes
+    to the next ancestor; past the root, ``error_response`` maps it.
+
+    Async handlers run on the event loop; sync ones in a worker thread. An
+    awaitable result, such as a sync wrapper's coroutine, is awaited before
+    the ``Response`` check. Each ancestor runs inside the ``except`` of the
+    one below it, so a bare ``raise`` there re-raises the latest exception."""
+    if not handlers:
+        return error_response(exc)
+    *ancestors, handler = handlers
+    try:
+        if _is_async(handler):
+            response = handler(request, exc)
+        else:
+            response = await asyncio.to_thread(
+                _call_sync_handler, handler, request, exc
+            )
+        if inspect.isawaitable(response):  # still inside the caller's except
+            response = await response
+        if not isinstance(response, Response):
+            name = getattr(handler, "__qualname__", repr(handler))
+            raise TypeError(
+                f"handle_error {handler.__module__}.{name} "
+                f"returned {response!r}, not a Response"
+            )
+    except Exception as raised:
+        return await _error_boundary(ancestors, request, raised)
+    return response
 
 
 def _wrap(middleware: Middleware, call_next: CallNext) -> CallNext:
@@ -83,6 +138,8 @@ class Haumea:
         """``(path, method)`` pairs served but left out of the OpenAPI schema."""
         self.middleware: dict[str, tuple[Middleware, ...]] = {}
         """Each path's middleware chain, outermost first."""
+        self.error_handlers: dict[str, tuple[ErrorHandler, ...]] = {}
+        """Each path's error handlers, root to leaf; the leaf runs first."""
 
     def add_route(
         self,
@@ -92,21 +149,26 @@ class Haumea:
         *,
         include_in_schema: bool = True,
         middleware: Sequence[Middleware] = (),
+        error_handlers: Sequence[ErrorHandler] = (),
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
         serves it without documenting it in OpenAPI.
 
-        ``middleware`` wraps every method of ``path``, outermost first, so
-        each call for one path must pass the same chain."""
+        ``middleware`` wraps every method of ``path``, outermost first.
+        ``error_handlers`` (root to leaf) handle its endpoint's errors,
+        nearest first. Each call for one path must pass the same chains."""
         endpoint = Endpoint(handler, {m[1] for m in _PATH_PARAM.finditer(path)})
         endpoints = next((e for p, _, e in self.routes if p == path), None)
-        chain = tuple(middleware)
+        chain, handlers = tuple(middleware), tuple(error_handlers)
         if endpoints is None:
             endpoints = {}
             self.routes.append((path, _compile_path(path), endpoints))
             self.middleware[path] = chain
+            self.error_handlers[path] = handlers
         elif self.middleware[path] != chain:
             raise ValueError(f"conflicting middleware for route {path!r}")
+        elif self.error_handlers[path] != handlers:
+            raise ValueError(f"conflicting error handlers for route {path!r}")
         for method in map(str.upper, methods):
             endpoints[method] = endpoint
             if include_in_schema:
@@ -157,19 +219,22 @@ class Haumea:
         return None if none matches.
 
         The route's middleware wraps its endpoint, or the ``405`` when no
-        endpoint supports the method. Inside the innermost middleware,
-        endpoint errors already become their default ``Response``."""
+        endpoint supports the method. Inside the innermost middleware, the
+        route's error boundary has already turned endpoint errors into a
+        ``Response``."""
         for path, pattern, endpoints in routes:
             if match := pattern.fullmatch(request.path):
                 request.path_params = match.groupdict()
-                call = self._endpoint_call(endpoints)
+                call = self._endpoint_call(endpoints, self.error_handlers.get(path, ()))
                 for middleware in reversed(self.middleware.get(path, ())):
                     call = _wrap(middleware, call)
                 return await call(request)
         return None
 
     @staticmethod
-    def _endpoint_call(endpoints: dict[str, Endpoint]) -> CallNext:
+    def _endpoint_call(
+        endpoints: dict[str, Endpoint], error_handlers: Sequence[ErrorHandler]
+    ) -> CallNext:
         async def call(request: Request) -> Response:
             method = "GET" if request.method == "HEAD" else request.method
             endpoint = endpoints.get(request.method) or endpoints.get(method)
@@ -182,7 +247,7 @@ class Haumea:
                     return result
                 return JSONResponse(result)
             except Exception as exc:
-                return error_response(exc)
+                return await _error_boundary(error_handlers, request, exc)
 
         return call
 

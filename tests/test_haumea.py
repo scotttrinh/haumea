@@ -1172,6 +1172,299 @@ def test_middleware_conflicting_chains(tmp_path, isolated_imports):
         create_app(tmp_path / "app")
 
 
+def error_source(name: str, *, sync: bool) -> str:
+    """Source for an ``error.py`` that logs ``name!ExcType`` in ``mwlog.EVENTS``
+    and, by default, returns a JSON 503 naming itself and the exception. The
+    ``x-<name>`` header switches it to a bare ``raise`` (``reraise``), a new
+    ``HTTPException(409, name)`` (``raise``), or returning ``None``."""
+    return (
+        "import mwlog\n"
+        "from haumea import HTTPException, JSONResponse\n\n"
+        f"{'' if sync else 'async '}def handle_error(request, exc):\n"
+        f"    mwlog.EVENTS.append(f'{name}!{{type(exc).__name__}}')\n"
+        f"    action = request.headers.get('x-{name}')\n"
+        "    if action == 'reraise':\n"
+        "        raise\n"
+        "    if action == 'raise':\n"
+        f"        raise HTTPException(409, {name!r})\n"
+        "    if action == 'none':\n"
+        "        return None\n"
+        f"    return JSONResponse({{'by': {name!r}, 'error': str(exc)}}, 503)\n"
+    )
+
+
+@pytest.fixture
+def error_project(tmp_path, isolated_imports):
+    """Sync ``error.py`` at the root and in ``admin``, async in ``(group)``,
+    plus root and ``(group)`` middleware. ``/admin`` has all three error
+    files, ``/other`` the group's and root's, ``/plain`` only the root's.
+
+    Yields ``serve`` like ``middleware_project`` and the shared event log."""
+    write_project(
+        tmp_path,
+        {
+            "mwlog.py": "EVENTS = []\n",
+            "app/middleware.py": middleware_source("root"),
+            "app/error.py": error_source("root", sync=True),
+            "app/(group)/middleware.py": middleware_source("group"),
+            "app/(group)/error.py": error_source("group", sync=False),
+            "app/(group)/admin/error.py": error_source("admin", sync=True),
+            "app/(group)/admin/route.py": MIDDLEWARE_ROUTE,
+            "app/(group)/other/route.py": MIDDLEWARE_ROUTE,
+            "app/plain/route.py": MIDDLEWARE_ROUTE,
+        },
+    )
+    app_dir = tmp_path / "app"
+    dev = create_app(app_dir)
+    events: list[str] = sys.modules["mwlog"].EVENTS
+
+    def serve(factory, method, path, function: str, **kwargs) -> httpx.Response:
+        app = dev if factory == "dev" else create_route_app(app_dir, function)
+        events.clear()
+        return make_client(app)(method, path, **kwargs)
+
+    return serve, events
+
+
+# @lat: [[tests#Error boundaries#Nearest error.py wins]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_error_nearest_wins(error_project, factory):
+    serve, events = error_project
+
+    # Sync leaf handler; middleware sees its response from call_next.
+    response = serve(factory, "GET", "/admin?fail=boom", "admin")
+    assert response.status_code == 503
+    assert response.json() == {"by": "admin", "error": "boom"}
+    assert response.headers["x-seen-root"] == "503"
+    assert events == [
+        "root>",
+        "group>",
+        "handler",
+        "admin!RuntimeError",
+        "<group:503",
+        "<root:503",
+    ]
+
+    # Validation errors and a 405 reach the boundary too.
+    response = serve(factory, "GET", "/admin?n=bad", "admin")
+    assert response.json()["by"] == "admin"
+    assert events[2] == "admin!RequestValidationError"
+    response = serve(factory, "POST", "/admin", "admin")
+    assert response.json() == {"by": "admin", "error": "405: Method Not Allowed"}
+
+    # Async nearest handler.
+    response = serve(factory, "GET", "/other?fail=401", "other")
+    assert response.json() == {"by": "group", "error": "401: nope"}
+    assert events == [
+        "root>",
+        "group>",
+        "handler",
+        "group!HTTPException",
+        "<group:503",
+        "<root:503",
+    ]
+
+    response = serve(factory, "GET", "/plain?fail=boom", "plain")
+    assert response.json() == {"by": "root", "error": "boom"}
+    assert events == ["root>", "handler", "root!RuntimeError", "<root:503"]
+
+    # Successful responses skip the boundary.
+    assert serve(factory, "GET", "/admin?n=2", "admin").json() == {"n": 2}
+    assert not [event for event in events if "!" in event]
+
+
+# @lat: [[tests#Error boundaries#Re-raising passes to the next ancestor]]
+@pytest.mark.parametrize("factory", FACTORIES)
+@pytest.mark.parametrize(
+    ("actions", "ran", "expected"),
+    [
+        # A bare raise passes the same exception on.
+        (
+            {"admin": "reraise"},
+            ["admin!RuntimeError", "group!RuntimeError"],
+            {"by": "group", "error": "boom"},
+        ),
+        # A new exception replaces it, even through a later bare raise
+        # in the async group or the sync root.
+        (
+            {"admin": "raise"},
+            ["admin!RuntimeError", "group!HTTPException"],
+            {"by": "group", "error": "409: admin"},
+        ),
+        (
+            {"admin": "raise", "group": "reraise"},
+            ["admin!RuntimeError", "group!HTTPException", "root!HTTPException"],
+            {"by": "root", "error": "409: admin"},
+        ),
+        # Past the root the default mapping applies to the last exception.
+        (
+            {"admin": "reraise", "group": "raise", "root": "reraise"},
+            ["admin!RuntimeError", "group!RuntimeError", "root!HTTPException"],
+            {"detail": "group"},
+        ),
+    ],
+)
+def test_error_reraise(error_project, factory, actions, ran, expected):
+    serve, events = error_project
+    headers = {f"x-{name}": action for name, action in actions.items()}
+    response = serve(factory, "GET", "/admin?fail=boom", "admin", headers=headers)
+    assert [event for event in events if "!" in event] == ran
+    assert response.json() == expected
+    assert response.headers["x-seen-root"] == str(response.status_code)
+
+
+# @lat: [[tests#Error boundaries#Non-response result]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_error_non_response(error_project, factory):
+    serve, events = error_project
+    headers = {"x-admin": "none"}
+    response = serve(factory, "GET", "/admin?fail=boom", "admin", headers=headers)
+    assert [event for event in events if "!" in event] == [
+        "admin!RuntimeError",
+        "group!TypeError",
+    ]
+    body = response.json()
+    assert body["by"] == "group"
+    assert body["error"].endswith("returned None, not a Response")
+
+    headers = {"x-admin": "none", "x-group": "none", "x-root": "none"}
+    response = serve(factory, "GET", "/admin?fail=boom", "admin", headers=headers)
+    assert (response.status_code, response.text) == (500, "Internal Server Error")
+
+
+# @lat: [[tests#Error boundaries#Unhandled errors get the default mapping]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_error_unhandled_default(error_project, tmp_path, factory):
+    serve, events = error_project
+    headers = {"x-admin": "reraise", "x-group": "reraise", "x-root": "reraise"}
+    response = serve(factory, "GET", "/admin?fail=boom", "admin", headers=headers)
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert response.headers["x-seen-root"] == "500"
+    assert [event for event in events if "!" in event] == [
+        "admin!RuntimeError",
+        "group!RuntimeError",
+        "root!RuntimeError",
+    ]
+
+    # A project without any error.py keeps today's mapping.
+    project = tmp_path / "bare"
+    write_project(project, {"app/x/route.py": MIDDLEWARE_ROUTE})
+    app = (
+        create_app(project / "app")
+        if factory == "dev"
+        else create_route_app(project / "app", "x")
+    )
+    client = make_client(app)
+    response = client("GET", "/x?fail=401")
+    assert (response.status_code, response.json()) == (401, {"detail": "nope"})
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert client("GET", "/x?n=bad").status_code == 422
+    response = client("GET", "/x?fail=boom")
+    assert (response.status_code, response.text) == (500, "Internal Server Error")
+
+
+# @lat: [[tests#Error boundaries#Middleware errors skip error.py]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_error_skips_middleware_errors(error_project, factory):
+    serve, events = error_project
+    for kind, status in [("other", 500), ("http", 403), ("validation", 422)]:
+        headers = {"x-raise": "group", "x-raise-kind": kind}
+        response = serve(factory, "GET", "/admin", "admin", headers=headers)
+        assert response.status_code == status
+        assert events == ["root>", "group>"]
+
+    # No route, no segment files.
+    response = serve(factory, "GET", "/nope", "admin")
+    assert response.status_code == 404
+    assert events == []
+
+
+ASYNC_RESULT = (
+    "from haumea import JSONResponse\n\n"
+    "async def respond(request, exc, by):\n"
+    "    if request.headers.get('x-reraise'):\n"
+    "        raise\n"
+    "    return JSONResponse({'by': by, 'error': str(exc)}, 503)\n\n"
+)
+
+
+# @lat: [[tests#Error boundaries#Awaitable handlers]]
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_error_awaitable_handlers(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/error.py": (
+                "from haumea import JSONResponse\n\n"
+                "def handle_error(request, exc):\n"
+                "    return JSONResponse({'by': 'root', 'error': str(exc)}, 500)\n"
+            ),
+            "app/obj/error.py": ASYNC_RESULT
+            + (
+                "class Handler:\n"
+                "    async def __call__(self, request, exc):\n"
+                "        return await respond(request, exc, 'obj')\n\n"
+                "handle_error = Handler()\n"
+            ),
+            "app/obj/route.py": MIDDLEWARE_ROUTE,
+            "app/wrapper/error.py": ASYNC_RESULT
+            + (
+                "def handle_error(request, exc):\n"
+                "    return respond(request, exc, 'wrapper')\n"
+            ),
+            "app/wrapper/route.py": MIDDLEWARE_ROUTE,
+            "mwlog.py": "EVENTS = []\n",
+        },
+    )
+    app_dir = tmp_path / "app"
+    for name in ["obj", "wrapper"]:
+        app = (
+            create_app(app_dir) if factory == "dev" else create_route_app(app_dir, name)
+        )
+        client = make_client(app)
+        response = client("GET", f"/{name}?fail=boom")
+        assert response.json() == {"by": name, "error": "boom"}
+
+        # A bare raise in the awaited body re-raises the original exception.
+        response = client("GET", f"/{name}?fail=boom", headers={"x-reraise": "1"})
+        assert response.json() == {"by": "root", "error": "boom"}
+
+
+# @lat: [[tests#Error boundaries#Invalid error.py]]
+@pytest.mark.parametrize("source", ["x = 1\n", "handle_error = 1\n"])
+def test_invalid_error_handler(tmp_path, isolated_imports, source):
+    write_project(
+        tmp_path,
+        {
+            "app/(group)/error.py": source,
+            "app/(group)/a/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    file = (tmp_path / "app" / "(group)" / "error.py").resolve()
+    for make_app in [
+        lambda: create_app(tmp_path / "app"),
+        lambda: create_route_app(tmp_path / "app", "a"),
+    ]:
+        with pytest.raises(TypeError, match=re.escape(str(file))):
+            make_app()
+
+
+# @lat: [[tests#Error boundaries#Conflicting error.py for one path]]
+def test_error_conflicting_handlers(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            "app/(a)/error.py": "def handle_error(request, exc):\n    raise\n",
+            "app/(a)/x/route.py": "def GET():\n    return {}\n",
+            "app/(b)/x/route.py": "def POST():\n    return {}\n",
+        },
+    )
+    with pytest.raises(ValueError, match="conflicting error handlers for route '/x'"):
+        create_app(tmp_path / "app")
+
+
 # @lat: [[tests#Route module isolation]]
 def test_route_module_isolation(tmp_path, isolated_imports):
     for name in ["one", "two"]:

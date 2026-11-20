@@ -31,12 +31,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-from haumea.app import Haumea, Middleware
+from haumea.app import ErrorHandler, Haumea, Middleware
 from haumea.config import normalize_base_path, project_base_path
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
 MIDDLEWARE_FILE = "middleware.py"
+ERROR_FILE = "error.py"
 
 
 def load_module(path: Path) -> ModuleType:
@@ -171,8 +172,23 @@ def _middleware(route: Route) -> list[Middleware]:
     return chain
 
 
+def _error_handlers(route: Route) -> list[ErrorHandler]:
+    """Each ancestor ``error.py``'s ``handle_error``, root to leaf."""
+    handlers = []
+    for module in route.load_segments(ERROR_FILE):
+        handler = getattr(module, "handle_error", None)
+        if not callable(handler):
+            raise TypeError(
+                f"invalid `handle_error` in {module.__file__}: expected "
+                f"`def handle_error(request, exc)`, got {handler!r}"
+            )
+        handlers.append(handler)
+    return handlers
+
+
 def _add_route(app: Haumea, route: Route) -> None:
     middleware = _middleware(route)
+    error_handlers = _error_handlers(route)
     module = route.load()
     include_in_schema = _include_in_schema(module, route)
     for method in HTTP_METHODS:
@@ -184,6 +200,7 @@ def _add_route(app: Haumea, route: Route) -> None:
                 methods=[method],
                 include_in_schema=include_in_schema,
                 middleware=middleware,
+                error_handlers=error_handlers,
             )
 
 
