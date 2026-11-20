@@ -37,6 +37,28 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
 
 
+def load_module(path: Path) -> ModuleType:
+    """Import a route or segment file once per process, keyed only by its
+    resolved path: files from different projects never share a
+    ``sys.modules`` entry, and one file reached from several routes or
+    prefixes reuses its module. A failed import leaves no partial module
+    behind, so a retry runs the file again."""
+    digest = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:12]
+    name = f"haumea_routes._{digest}"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
 @dataclass(frozen=True)
 class Route:
     url_path: str
@@ -47,32 +69,33 @@ class Route:
     pattern: str | None
     """Regex matching this route's URLs, or None if the path is static."""
     rank: tuple[int, ...]
+    segments: tuple[Path, ...]
+    """Directories from ``app/`` down to the route's own, root to leaf.
+    Route groups and dynamic directories count."""
 
     def load(self) -> ModuleType:
-        """Import the route module once, keyed only by its resolved source
-        file: routes from different projects never share a ``sys.modules``
-        entry, and one file loaded under two prefixes reuses its module.
-        A failed import leaves no partial module behind."""
-        digest = hashlib.sha1(str(self.file.resolve()).encode()).hexdigest()[:12]
-        name = f"haumea_routes._{digest}"
-        if name in sys.modules:
-            return sys.modules[name]
-        spec = importlib.util.spec_from_file_location(name, self.file)
-        assert spec and spec.loader
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            sys.modules.pop(name, None)
-            raise
-        return module
+        """Import the route module via ``load_module``."""
+        return load_module(self.file)
+
+    def load_segments(self, filename: str) -> list[ModuleType]:
+        """Load ``filename`` from each of this route's segments that has one,
+        root to leaf, via ``load_module``. Sibling directories are never
+        touched."""
+        return [
+            load_module(segment / filename)
+            for segment in self.segments
+            if (segment / filename).is_file()
+        ]
 
 
 def _route(app_dir: Path, route_file: Path, base_path: str = "") -> Route:
     """``base_path`` must already be normalized."""
     url, function, regex, rank = [], [], [], []
-    for part in route_file.parent.relative_to(app_dir).parts:
+    parts = route_file.parent.relative_to(app_dir).parts
+    segments = [app_dir]
+    for part in parts:
+        segments.append(segments[-1] / part)
+    for part in parts:
         if part.startswith("(") and part.endswith(")"):
             continue  # route group: organizational only
         function.append(part)
@@ -96,6 +119,7 @@ def _route(app_dir: Path, route_file: Path, base_path: str = "") -> Route:
         function="/".join(function) or "index",
         pattern=f"^{re.escape(base_path)}/{'/'.join(regex)}$" if any(rank) else None,
         rank=tuple(rank),
+        segments=tuple(segments),
     )
 
 

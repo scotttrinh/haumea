@@ -45,7 +45,7 @@ from haumea.build import build, emit_build, plan_build
 from haumea.cli import main as cli_main
 from haumea.config import normalize_base_path
 from haumea.openapi import swagger_html
-from haumea.routing import discover_routes
+from haumea.routing import discover_routes, load_module
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
 FULLSTACK = Path(__file__).parent.parent / "examples" / "fullstack"
@@ -784,6 +784,111 @@ def test_route_load_cache(tmp_path, isolated_imports):
     for _ in range(2):  # retried, not served from a partial cache entry
         with pytest.raises(RuntimeError, match="boom"):
             prefixed["/v1/bad"].load()
+        assert set(sys.modules) == before
+
+
+# @lat: [[tests#Route segments]]
+def test_route_segments(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            name: "def GET():\n    return {}\n"
+            for name in [
+                "app/route.py",
+                "app/a/b/route.py",
+                "app/(admin)/users/route.py",
+                "app/items/[id]/route.py",
+                "app/files/[...path]/route.py",
+            ]
+        },
+    )
+    app = (tmp_path / "app").resolve()
+    for base in ["", "/v1"]:
+        segments = {
+            r.file.relative_to(app).as_posix(): r.segments
+            for r in discover_routes(tmp_path / "app", base)
+        }
+        assert segments == {
+            "route.py": (app,),
+            "a/b/route.py": (app, app / "a", app / "a" / "b"),
+            "(admin)/users/route.py": (app, app / "(admin)", app / "(admin)" / "users"),
+            "items/[id]/route.py": (app, app / "items", app / "items" / "[id]"),
+            "files/[...path]/route.py": (
+                app,
+                app / "files",
+                app / "files" / "[...path]",
+            ),
+        }
+
+
+def logging_segment(log: Path, name: str) -> str:
+    """Source for a segment file that appends ``name`` to ``log`` when run."""
+    return (
+        f"NAME = {name!r}\n"
+        f"with open({str(log)!r}, 'a') as f:\n"
+        "    f.write(NAME + '\\n')\n"
+    )
+
+
+# @lat: [[tests#Ancestor segment loading]]
+def test_route_load_segments(tmp_path, isolated_imports):
+    log = tmp_path / "runs.log"
+    write_project(
+        tmp_path,
+        {
+            "app/segment.py": logging_segment(log, "root"),
+            "app/admin/segment.py": logging_segment(log, "admin"),
+            "app/admin/users/route.py": "def GET():\n    return {}\n",
+            "app/admin/(group)/settings/route.py": "def GET():\n    return {}\n",
+            "app/public/segment.py": logging_segment(log, "public"),
+            "app/public/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    routes = {r.url_path: r for r in discover_routes(tmp_path / "app")}
+
+    users = routes["/admin/users"].load_segments("segment.py")
+    assert [m.NAME for m in users] == ["root", "admin"]  # root to leaf
+    assert log.read_text().split() == ["root", "admin"]  # sibling not loaded
+
+    # A route sharing those ancestors reuses their modules.
+    settings = routes["/admin/settings"].load_segments("segment.py")
+    assert all(a is b for a, b in zip(settings, users, strict=True))
+    assert log.read_text().split() == ["root", "admin"]
+
+    public = routes["/public"].load_segments("segment.py")
+    assert [m.NAME for m in public] == ["root", "public"]
+    assert public[0] is users[0]
+    assert log.read_text().split() == ["root", "admin", "public"]
+
+    assert routes["/admin/users"].load_segments("middleware.py") == []
+
+
+# @lat: [[tests#Segment module loading]]
+def test_segment_module_loading(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            "app/segment.py": logging_segment(tmp_path / "runs.log", "root"),
+            "app/bad.py": "raise RuntimeError('boom')\n",
+            "app/one/route.py": "def GET():\n    return {}\n",
+            "app/two/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    routes = discover_routes(tmp_path / "app")
+    assert len(routes) == 2
+    # Sibling routes share their root segment, so its file loads once.
+    modules = {load_module(r.segments[0] / "segment.py") for r in routes}
+    assert len(modules) == 1
+    assert load_module(tmp_path / "app" / "segment.py") in modules
+    assert (tmp_path / "runs.log").read_text().split() == ["root"]
+
+    # A route file and its module share the cache.
+    assert load_module(routes[0].file) is routes[0].load()
+
+    before = set(sys.modules)
+    for _ in range(2):  # retried, not served from a partial cache entry
+        with pytest.raises(RuntimeError, match="boom"):
+            load_module(routes[0].segments[0] / "bad.py")
         assert set(sys.modules) == before
 
 

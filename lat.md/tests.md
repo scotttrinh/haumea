@@ -58,6 +58,18 @@ Non-`GET`/`HEAD` requests to those files get `405` with `Allow: GET, HEAD` befor
 
 Verify [[src/haumea/routing.py#Route#load]] returns one module for a file discovered under two prefixes, and that a failing import leaves `sys.modules` unchanged and raises again on retry.
 
+## Route segments
+
+Verify `Route.segments` lists the directories from `app/` to the route's own directory, root to leaf, for the root route, nested routes, `(group)` directories, and `[id]` and `[...path]` segments, with and without `base_path`.
+
+## Segment module loading
+
+Verify [[src/haumea/routing.py#load_module]] runs a segment file once when two sibling routes load it, shares the cache with [[src/haumea/routing.py#Route#load]], and leaves `sys.modules` clean after a failing import that raises again on retry.
+
+## Ancestor segment loading
+
+Verify [[src/haumea/routing.py#Route#load_segments]] loads only the route's own ancestor files, root to leaf, skipping a sibling directory's file and missing files, and that routes sharing an ancestor (including through a route group) reuse its module.
+
 ## Route module isolation
 
 Verify `app/route.py` in two projects loads two modules, and that `base_path = "/v1+"` keeps `app/route.py` and `app/!/route.py` apart: modules are keyed by file, not by the function path.

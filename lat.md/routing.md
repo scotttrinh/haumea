@@ -14,6 +14,10 @@ Routes are discovered from `route.py` files under `app/` and sorted from most sp
 
 With a normalized `base_path` ([[config#Base Path]]), `url_path`, `function` and `pattern` all carry the prefix: under `/api`, `app/route.py` is `/api` (function `api`) and `app/users/[id]/route.py` is `/api/users/{id}` (function `api/users/[id]`, pattern `^/api/users/([^/]+)$`). Only an unprefixed root route is named `index`.
 
+Each [[src/haumea/routing.py#Route]] also records `segments`: the directories from the resolved `app_dir` down to the route's own directory, inclusive and ordered root to leaf. Route groups and dynamic directories count, so `app/(admin)/users/route.py` has `app/`, `app/(admin)/`, `app/(admin)/users/`, and `app/route.py` has just `app/`.
+
+[[src/haumea/routing.py#Route#load_segments]] loads a named file from each segment directory that has one, root to leaf, via [[src/haumea/routing.py#load_module]]. It reads only the route's own ancestors, never a sibling directory, and returns an empty list when no ancestor has the file. Neither app factory calls it yet: no segment file such as `middleware.py` or `error.py` affects request handling.
+
 Routes are sorted by `(route.rank, route.url_path)` so static paths (e.g. `/items/new`) match before dynamic ones (`/items/{item_id}`), and catch-alls match last. When discovering routes, [[src/haumea/routing.py#discover_routes]] also prepends `app_dir.parent` to `sys.path` so route modules can import sibling project packages.
 
 ## Handler Registration
@@ -22,7 +26,7 @@ Each `route.py` exports top-level functions named after standard HTTP methods.
 
 [[src/haumea/routing.py#_add_route]] loads the module via [[src/haumea/routing.py#Route#load]] and registers any callable matching [[src/haumea/routing.py#HTTP_METHODS]].
 
-[[src/haumea/routing.py#Route#load]] caches the module in `sys.modules` as `haumea_routes._<hash>`, keyed only by 12 hex digits of the SHA-1 of the resolved `route.py` path. Same-named routes in different projects never share a module, and one file discovered under two `base_path` values reuses one. If the import raises, the entry is removed before re-raising, so no partial module is cached.
+[[src/haumea/routing.py#Route#load]] delegates to [[src/haumea/routing.py#load_module]], which [[src/haumea/routing.py#Route#load_segments]] also uses. It caches each module in `sys.modules` as `haumea_routes._<hash>`, keyed only by 12 hex digits of the SHA-1 of the resolved file path. Same-named files in different projects never share a module, and one file reached from several routes or two `base_path` values reuses one, so a file runs at most once per process. If the import raises, the entry is removed before re-raising, so no partial module is cached.
 
 - [[src/haumea/routing.py#create_app]] registers all discovered routes and enables `/docs`, `/openapi.json`, and optional `public_dir` static serving.
 - [[src/haumea/routing.py#create_route_app]] registers only the single [[src/haumea/routing.py#Route]] matching `function` and sets `docs=False`.
