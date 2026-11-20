@@ -95,7 +95,7 @@ Each step should land as its own reviewable change with its tests. When a step c
 
 ## Phase 3: Request and response surface
 
-**Goal:** the runtime pieces AI/API endpoints need. Steps 3.2 to 3.5 are independent of each other.
+**Goal:** the runtime pieces AI/API endpoints need. Steps 3.2 to 3.4 are independent of each other.
 
 ### 3.1 `Response` takes `receive`; `StreamingResponse` and `SSEResponse` (§6.1)
 
@@ -114,15 +114,6 @@ Each step should land as its own reviewable change with its tests. When a step c
 - **Tests:** a request with and without the Vercel headers.
 
 ### 3.4 `include_in_schema` and `lazy()` (§6.4, §6.6)
-
-### 3.5 `after()` (§6.5)
-
-- **What:** the `local` and `wait_until` backends, the `after_backend` switch, and the build installing and bundling `vercel-functions`.
-- **Tests:**
-  - The work runs after the response body is sent.
-  - Exceptions are logged.
-  - Calling `after()` outside a request raises.
-  - The generated entrypoint selects `wait_until`.
 
 ### 3.6 Explicit OpenAPI security and response metadata (§6.7)
 
@@ -168,9 +159,24 @@ Each step should land as its own reviewable change with its tests. When a step c
 
 ---
 
+## Phase 5: Background work
+
+**Goal:** run post-response work locally in dev/tests and via `wait_until` in deployed functions once `vercel-functions` exports `vercel.functions.wait_until`.
+
+### 5.1 `after()` (§6.5)
+
+- **What:** the `local` and `wait_until` backends, the `after_backend` switch, and the build installing and bundling `vercel-functions`.
+- **Tests:**
+  - The work runs after the response body is sent.
+  - Exceptions are logged.
+  - Calling `after()` outside a request raises.
+  - The generated entrypoint selects `wait_until`.
+
+---
+
 ## Gates and dependencies
 
 - **Spike first.** Done. 1.1 confirmed that the service build writes to `<service root>/.vercel/output` (spec §2.1), so 1.3 keeps that location.
 - **Workspace fixture before tree-shaking.** 2.3 builds on the 1.2 refactor and should run against the 1.5 fixture, because shared workspace packages are where the size savings show up.
-- **`after()` needs `vercel-functions` published.** It is expected well before 3.5 starts. Confirm its import path then.
+- **`after()` needs `vercel.functions.wait_until` published.** Moved to 5.1 because `vercel-functions` 0.1.4 only ships `vercel.env`; confirm the import path before starting 5.1.
 - **Segment tracing needs the tracer.** 4.4 requires 2.3.
