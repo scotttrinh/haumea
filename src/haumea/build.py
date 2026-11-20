@@ -46,7 +46,13 @@ from types import ModuleType
 
 from haumea.config import PYPROJECT, HaumeaConfig, load_config, read_pyproject
 from haumea.openapi import swagger_html
-from haumea.routing import Route, create_app, discover_routes
+from haumea.routing import (
+    ERROR_FILE,
+    MIDDLEWARE_FILE,
+    Route,
+    create_app,
+    discover_routes,
+)
 
 OUTPUT_DIR = Path(".vercel") / "output"
 UV_LOCK = "uv.lock"
@@ -391,7 +397,8 @@ class FunctionSpec:
     vc_config: dict[str, object]
     """Content of the function's ``.vc-config.json``."""
     trace_roots: tuple[Path, ...] = ()
-    """Project source files traced for this function (starting with ``route.py``)."""
+    """Project source files traced for this function: ``route.py``, then its
+    ancestor ``middleware.py`` and ``error.py`` files, root to leaf."""
     include: tuple[str, ...] = ()
     """PEP 503 normalized distribution names from module-level ``include``."""
 
@@ -504,7 +511,7 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
             function=route.function, base_path=base_path
         ),
         vc_config=config,
-        trace_roots=(route.file,),
+        trace_roots=(route.file, *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE)),
         include=_read_route_include(module, route),
     )
 

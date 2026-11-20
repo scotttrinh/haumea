@@ -2462,35 +2462,38 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
     assert json.loads(invoke(full, "beta", "/beta")["body"]) == {"result": "pkg-b"}
 
 
+def make_dist(
+    name: str,
+    module: str,
+    *,
+    requires: list[str] | None = None,
+    extra_files: dict[str, str] | None = None,
+    top_level: str | None = None,
+) -> dict[str, str]:
+    """Files for a fake installed distribution: a package, `METADATA` and
+    `RECORD`, ready for `write_project` into a store."""
+    dist_info = f"{name.replace('-', '_')}-1.0.dist-info"
+    meta_lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 1.0"]
+    for req in requires or ():
+        meta_lines.append(f"Requires-Dist: {req}")
+    files: dict[str, str] = {
+        f"{module}/__init__.py": f"NAME = {name!r}\n",
+        **(extra_files or {}),
+    }
+    record_lines = [f"{path},," for path in sorted(files)]
+    record_lines.append(f"{dist_info}/METADATA,,")
+    record_lines.append(f"{dist_info}/RECORD,,")
+    files[f"{dist_info}/METADATA"] = "\n".join(meta_lines) + "\n"
+    if top_level is not None:
+        files[f"{dist_info}/top_level.txt"] = top_level
+        record_lines.append(f"{dist_info}/top_level.txt,,")
+    files[f"{dist_info}/RECORD"] = "\n".join(record_lines) + "\n"
+    return files
+
+
 # @lat: [[tests#Import tracer and closure]]
 def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, capsys):
     from haumea.build import index_store
-
-    def make_dist(
-        name: str,
-        module: str,
-        *,
-        requires: list[str] | None = None,
-        extra_files: dict[str, str] | None = None,
-        top_level: str | None = None,
-    ) -> dict[str, str]:
-        dist_info = f"{name.replace('-', '_')}-1.0.dist-info"
-        meta_lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 1.0"]
-        for req in requires or ():
-            meta_lines.append(f"Requires-Dist: {req}")
-        files: dict[str, str] = {
-            f"{module}/__init__.py": f"NAME = {name!r}\n",
-            **(extra_files or {}),
-        }
-        record_lines = [f"{path},," for path in sorted(files)]
-        record_lines.append(f"{dist_info}/METADATA,,")
-        record_lines.append(f"{dist_info}/RECORD,,")
-        files[f"{dist_info}/METADATA"] = "\n".join(meta_lines) + "\n"
-        if top_level is not None:
-            files[f"{dist_info}/top_level.txt"] = top_level
-            record_lines.append(f"{dist_info}/top_level.txt,,")
-        files[f"{dist_info}/RECORD"] = "\n".join(record_lines) + "\n"
-        return files
 
     store_files: dict[str, str] = {}
     for dist in (
@@ -2645,6 +2648,113 @@ def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, c
         )
         with pytest.raises(ValueError, match="include"):
             plan_build(bad_proj)
+
+
+def lazy_middleware(*modules: str) -> str:
+    """Source for a pass-through ``middleware.py`` importing ``modules`` lazily,
+    so planning never needs them installed."""
+    imports = "".join(f"    import {module}\n" for module in modules)
+    return (
+        "async def middleware(request, call_next):\n"
+        f"{imports}"
+        "    return await call_next(request)\n"
+    )
+
+
+# @lat: [[tests#Segment files as trace roots]]
+def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, capsys):
+    store_files: dict[str, str] = {}
+    for dist in (
+        make_dist("haumea", "haumea"),
+        make_dist("vercel-runtime", "vercel_runtime"),
+        make_dist("root-mw-pkg", "root_mw_pkg"),
+        make_dist("admin-mw-pkg", "admin_mw_pkg"),
+        make_dist("admin-err-pkg", "admin_err_pkg"),
+        make_dist("audit-pkg", "audit_pkg"),
+        make_dist("public-mw-pkg", "public_mw_pkg"),
+    ):
+        store_files.update(dist)
+
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_project(vendor_dir, store_files)
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+
+    route = "def GET():\n    return {}\n"
+    project = tmp_path / "segments"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "segments"\nversion = "0"\n',
+            "helpers/__init__.py": "",
+            "helpers/audit.py": "import audit_pkg\n",
+            "app/middleware.py": lazy_middleware("root_mw_pkg"),
+            "app/route.py": route,
+            "app/admin/middleware.py": lazy_middleware("admin_mw_pkg", "helpers.audit"),
+            "app/admin/error.py": (
+                "def handle_error(request, exc):\n"
+                "    import admin_err_pkg\n"
+                "    raise exc\n"
+            ),
+            "app/admin/route.py": route,
+            "app/admin/(team)/members/route.py": route,
+            "app/admin/settings/[id]/route.py": route,
+            "app/public/middleware.py": lazy_middleware("public_mw_pkg"),
+            "app/public/route.py": route,
+            "app/(site)/about/route.py": route,
+        },
+    )
+    app = (project / "app").resolve()
+
+    plan = plan_build(project, platform=None)
+    by_name = {spec.name: spec for spec in plan.functions}
+    admin_segments = (
+        app / "middleware.py",
+        app / "admin" / "middleware.py",
+        app / "admin" / "error.py",
+    )
+    for name in ("admin", "admin/members", "admin/settings/[id]"):
+        spec = by_name[name]
+        assert spec.trace_roots == (spec.route.file, *admin_segments)
+    assert by_name["public"].trace_roots == (
+        app / "public" / "route.py",
+        app / "middleware.py",
+        app / "public" / "middleware.py",
+    )
+    for name in ("index", "about"):
+        spec = by_name[name]
+        assert spec.trace_roots == (spec.route.file, app / "middleware.py")
+
+    out = build(
+        project, platform=None, output=tmp_path / "out", explain="admin/members"
+    )
+    explain_out = capsys.readouterr().out
+
+    def bundled(function: str) -> set[str]:
+        vendor = out / "functions" / f"{function}.func" / "_vendor"
+        return set(build_module.index_store(vendor).distributions)
+
+    base = {"haumea", "vercel-runtime", "root-mw-pkg"}
+    admin_only = {"admin-mw-pkg", "admin-err-pkg", "audit-pkg"}
+    for name in ("admin", "admin/members", "admin/settings/[id]"):
+        assert bundled(name) == base | admin_only
+    assert bundled("public") == base | {"public-mw-pkg"}
+    for name in ("index", "about"):
+        assert bundled(name) == base
+
+    reasons = {
+        line.split()[0]: line for line in explain_out.splitlines() if "traced" in line
+    }
+    assert reasons.keys() == {"root-mw-pkg"} | admin_only
+    assert reasons["root-mw-pkg"].endswith("traced from app/middleware.py")
+    assert reasons["admin-mw-pkg"].endswith("traced from app/admin/middleware.py")
+    assert reasons["admin-err-pkg"].endswith("traced from app/admin/error.py")
+    assert reasons["audit-pkg"].endswith(
+        "traced from app/admin/middleware.py -> helpers/audit.py"
+    )
+    excluded = explain_out.split("Excluded (", 1)[1].split()
+    assert "public-mw-pkg" in excluded
 
 
 # @lat: [[tests#Build-time import check]]

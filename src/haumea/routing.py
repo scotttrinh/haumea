@@ -80,15 +80,21 @@ class Route:
         """Import the route module via ``load_module``."""
         return load_module(self.file)
 
-    def load_segments(self, filename: str) -> list[ModuleType]:
-        """Load ``filename`` from each of this route's segments that has one,
-        root to leaf, via ``load_module``. Sibling directories are never
+    def segment_files(self, *filenames: str) -> list[Path]:
+        """Existing ``filenames`` in this route's segments, root to leaf and in
+        the given order within each segment. Sibling directories are never
         touched."""
         return [
-            load_module(segment / filename)
+            segment / filename
             for segment in self.segments
+            for filename in filenames
             if (segment / filename).is_file()
         ]
+
+    def load_segments(self, filename: str) -> list[ModuleType]:
+        """Load ``filename`` from each of this route's segments that has one,
+        root to leaf, via ``load_module``."""
+        return [load_module(path) for path in self.segment_files(filename)]
 
 
 def _route(app_dir: Path, route_file: Path, base_path: str = "") -> Route:

@@ -240,6 +240,12 @@ Verify [[src/haumea/build.py#_trace_function_chains]], [[src/haumea/build.py#_re
 
 Covers `vercel-functions` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
+## Segment files as trace roots
+
+Verify [[src/haumea/build.py#plan_build]] adds each route's ancestor `middleware.py` and `error.py` to its `trace_roots`, so their dependencies are bundled only under that subtree.
+
+A dependency imported only by `app/admin/middleware.py` or `app/admin/error.py` (directly or through a project helper) lands in every function under `app/admin/`, including route-group and dynamic descendants, but not in sibling functions; a sibling's own `middleware.py` never enters an admin function's roots. `--explain` names the segment file at the head of each reason chain.
+
 ## Build-time import check
 
 Verify [[src/haumea/build.py#build]] with `platform=None` fails with a `RuntimeError` naming the function, missing module, and `include` when a route imports a workspace package by computed name, and succeeds once added to route or project `include`.
