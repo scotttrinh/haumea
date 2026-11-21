@@ -539,3 +539,23 @@ Verify in a fresh subprocess with a rejecting `sys.meta_path` finder installed b
 ### BaseModel parameter infers body source
 
 Verify over HTTP that unmarked and `Annotated` `pydantic.BaseModel` parameters report missing-input `422` errors at `["body"]`, while explicit `Query()` overrides and plain classes report missing-input `422` errors at `["query", ...]`.
+
+## Pydantic request validation
+
+Tests for cached `pydantic.TypeAdapter` decoding, validation, and `422` error mapping across HTTP endpoints.
+
+### Body binding for BaseModel shapes
+
+Verify over HTTP that single `BaseModel`, `Annotated[BaseModel, ...]`, multiple embedded `BaseModel` fields, optional/defaulted `BaseModel` with empty bodies, and `list[BaseModel]` all validate and bind.
+
+### Invalid payloads and malformed JSON
+
+Verify over HTTP that invalid single, nested, `list[BaseModel]`, and strict embedded `BaseModel` payloads, empty required bodies, and malformed JSON return `422` with field-level `loc` paths and messages.
+
+### Cached TypeAdapter and containers
+
+Verify that `pydantic.TypeAdapter` is built once per Pydantic-backed field at route registration and reused across requests, and that `dict[str, BaseModel]` bodies and string-sourced `Query()` models validate with `strict=False`.
+
+### Specialized TypeAliasType and strict JSON
+
+Verify that a specialized `TypeAliasType` wrapping a `BaseModel` (`type Payload[T] = tuple[T, Item]`) caches a `TypeAdapter` and binds over HTTP, and that a strict `BaseModel` `date` field validates via `validate_json(raw)` from raw JSON bytes.

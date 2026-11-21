@@ -5451,3 +5451,287 @@ def test_pydantic_basemodel_infers_body_source(monkeypatch):
         assert response.json() == {
             "detail": [{"loc": expected_loc, "msg": "Field required"}]
         }
+
+
+# @lat: [[tests#Pydantic request validation#Body binding for BaseModel shapes]]
+def test_pydantic_body_validation_and_binding():
+    from pydantic import AfterValidator, BaseModel
+
+    class Tag(BaseModel):
+        label: str
+
+    class Item(BaseModel):
+        name: str
+        count: int = 1
+        tags: list[Tag] = []
+
+    class Meta(BaseModel):
+        source: str
+
+    def strip_name(item: Item) -> Item:
+        return item.model_copy(update={"name": item.name.strip()})
+
+    def single(item: Item) -> dict[str, Any]:
+        return {
+            "name": item.name,
+            "count": item.count,
+            "tags": [tag.label for tag in item.tags],
+        }
+
+    def annotated(
+        item: Annotated[Item, AfterValidator(strip_name)],
+    ) -> dict[str, Any]:
+        return {"name": item.name, "count": item.count}
+
+    def embedded(item: Item, meta: Meta) -> dict[str, Any]:
+        return {"name": item.name, "source": meta.source}
+
+    def optional_body(
+        item: Annotated[Item | None, Body()] = None,
+    ) -> dict[str, Any]:
+        return {"name": item.name if item is not None else None}
+
+    default_item = Item(name="fallback", count=0)
+
+    def defaulted_body(item: Item = default_item) -> dict[str, Any]:
+        return {"name": item.name, "count": item.count}
+
+    def list_body(items: Annotated[list[Item], Body()]) -> dict[str, Any]:
+        return {"names": [item.name for item in items]}
+
+    app = Haumea(docs=False)
+    app.add_route("/single", single, methods=["POST"])
+    app.add_route("/annotated", annotated, methods=["POST"])
+    app.add_route("/embedded", embedded, methods=["POST"])
+    app.add_route("/optional", optional_body, methods=["POST"])
+    app.add_route("/defaulted", defaulted_body, methods=["POST"])
+    app.add_route("/list", list_body, methods=["POST"])
+    client = make_client(app)
+
+    res = client(
+        "POST",
+        "/single",
+        json={"name": "widget", "count": 3, "tags": [{"label": "sale"}]},
+    )
+    assert res.status_code == 200
+    assert res.json() == {"name": "widget", "count": 3, "tags": ["sale"]}
+
+    res = client("POST", "/annotated", json={"name": "  padded  "})
+    assert res.status_code == 200
+    assert res.json() == {"name": "padded", "count": 1}
+
+    res = client(
+        "POST",
+        "/embedded",
+        json={"item": {"name": "widget", "count": 2}, "meta": {"source": "api"}},
+    )
+    assert res.status_code == 200
+    assert res.json() == {"name": "widget", "source": "api"}
+
+    res = client("POST", "/optional")
+    assert res.status_code == 200
+    assert res.json() == {"name": None}
+
+    res = client("POST", "/optional", json={"name": "present"})
+    assert res.status_code == 200
+    assert res.json() == {"name": "present"}
+
+    res = client("POST", "/defaulted")
+    assert res.status_code == 200
+    assert res.json() == {"name": "fallback", "count": 0}
+
+    res = client("POST", "/list", json=[{"name": "a"}, {"name": "b", "count": 4}])
+    assert res.status_code == 200
+    assert res.json() == {"names": ["a", "b"]}
+
+
+# @lat: [[tests#Pydantic request validation#Invalid payloads and malformed JSON]]
+def test_pydantic_validation_errors_and_malformed_json():
+    from pydantic import BaseModel
+    from pydantic import Field as PydanticField
+
+    class Tag(BaseModel):
+        label: str = PydanticField(min_length=2)
+
+    class Item(BaseModel):
+        name: str
+        count: int = PydanticField(ge=1)
+        tags: list[Tag] = []
+
+    class Meta(BaseModel):
+        source: str
+
+    def single(item: Item) -> dict[str, Any]:
+        return {"name": item.name}
+
+    def embedded(item: Item, meta: Meta) -> dict[str, Any]:
+        return {"name": item.name, "source": meta.source}
+
+    def list_body(items: Annotated[list[Item], Body()]) -> dict[str, Any]:
+        return {"count": len(items)}
+
+    app = Haumea(docs=False)
+    app.add_route("/single", single, methods=["POST"])
+    app.add_route("/embedded", embedded, methods=["POST"])
+    app.add_route("/list", list_body, methods=["POST"])
+    client = make_client(app)
+
+    # Nested field + array index + multiple errors in one model
+    res = client(
+        "POST",
+        "/single",
+        json={"count": 0, "tags": [{"label": "ok"}, {"label": "x"}]},
+    )
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    locs = [entry["loc"] for entry in detail]
+    assert ["body", "name"] in locs
+    assert ["body", "count"] in locs
+    assert ["body", "tags", 1, "label"] in locs
+    assert all(isinstance(entry["msg"], str) and entry["msg"] for entry in detail)
+
+    # Top-level list[BaseModel] array index loc
+    res = client(
+        "POST",
+        "/list",
+        json=[{"name": "good", "count": 1}, {"name": "bad", "count": "nope"}],
+    )
+    assert res.status_code == 422
+    assert any(entry["loc"] == ["body", 1, "count"] for entry in res.json()["detail"])
+
+    # Embedded BaseModel strict validation & field-level loc
+    res = client(
+        "POST",
+        "/embedded",
+        json={"item": {"name": "widget", "count": "2"}},
+    )
+    assert res.status_code == 422
+    embedded_locs = [entry["loc"] for entry in res.json()["detail"]]
+    assert ["body", "item", "count"] in embedded_locs
+    assert ["body", "meta"] in embedded_locs
+
+    # Empty body for required BaseModel
+    res = client("POST", "/single")
+    assert res.status_code == 422
+    assert res.json() == {"detail": [{"loc": ["body"], "msg": "Field required"}]}
+
+    # Malformed JSON for single BaseModel body
+    res = client(
+        "POST",
+        "/single",
+        content=b"{not valid json",
+        headers={"content-type": "application/json"},
+    )
+    assert res.status_code == 422
+    malformed = res.json()["detail"]
+    assert len(malformed) == 1
+    assert malformed[0]["loc"] == ["body"]
+    assert malformed[0]["msg"]
+
+
+# @lat: [[tests#Pydantic request validation#Cached TypeAdapter and containers]]
+def test_pydantic_type_adapter_cached_and_containers(monkeypatch):
+    import pydantic
+    from pydantic import BaseModel, model_validator
+
+    class Item(BaseModel):
+        name: str
+
+    class QueryFilter(BaseModel):
+        key: str
+        value: int
+
+        @model_validator(mode="before")
+        @classmethod
+        def parse_pair(cls, raw: Any) -> Any:
+            if isinstance(raw, str) and ":" in raw:
+                key, value = raw.split(":", 1)
+                return {"key": key, "value": value}
+            return raw
+
+    created = 0
+    real_adapter = pydantic.TypeAdapter
+
+    def counting_adapter(annotation: Any) -> Any:
+        nonlocal created
+        created += 1
+        return real_adapter(annotation)
+
+    monkeypatch.setattr(pydantic, "TypeAdapter", counting_adapter)
+
+    def handle(
+        items: Annotated[dict[str, Item], Body()],
+        filt: Annotated[QueryFilter, Query()],
+    ) -> dict[str, Any]:
+        return {
+            "keys": sorted(items),
+            "names": [items[k].name for k in sorted(items)],
+            "filter": {"key": filt.key, "value": filt.value},
+        }
+
+    app = Haumea(docs=False)
+    app.add_route("/items", handle, methods=["POST"])
+    # Built once per Pydantic-backed field during Endpoint construction.
+    assert created == 2
+
+    client = make_client(app)
+    for _ in range(3):
+        res = client(
+            "POST",
+            "/items?filt=min:5",
+            json={"a": {"name": "alpha"}, "b": {"name": "beta"}},
+        )
+        assert res.status_code == 200
+        assert res.json() == {
+            "keys": ["a", "b"],
+            "names": ["alpha", "beta"],
+            "filter": {"key": "min", "value": 5},
+        }
+
+    bad = client("POST", "/items?filt=min:bad", json={"a": {"name": "alpha"}})
+    assert bad.status_code == 422
+    assert any(
+        entry["loc"] == ["query", "filt", "value"] for entry in bad.json()["detail"]
+    )
+    # Never rebuilt per request.
+    assert created == 2
+
+
+# @lat: [[tests#Pydantic request validation#Specialized TypeAliasType and strict JSON]]
+def test_pydantic_specialized_type_alias_and_strict_json_mode():
+    from datetime import date
+
+    from pydantic import BaseModel, ConfigDict
+
+    class Item(BaseModel):
+        count: int
+
+    type Payload[T] = tuple[T, Item]
+
+    class Event(BaseModel):
+        model_config = ConfigDict(strict=True)
+        day: date
+
+    def alias_handler(
+        payload: Annotated[Payload[str], Body()],
+    ) -> dict[str, Any]:
+        label, item = payload
+        return {"label": label, "count": item.count}
+
+    def strict_handler(event: Event) -> dict[str, Any]:
+        return {"day": event.day.isoformat()}
+
+    app = Haumea(docs=False)
+    app.add_route("/alias", alias_handler, methods=["POST"])
+    app.add_route("/strict", strict_handler, methods=["POST"])
+    client = make_client(app)
+
+    res = client("POST", "/alias", json=["label", {"count": 7}])
+    assert res.status_code == 200
+    assert res.json() == {"label": "label", "count": 7}
+
+    # In JSON mode (validate_json), ISO date strings satisfy strict=True date fields;
+    # validate_python(..., strict=True) would reject a str.
+    res = client("POST", "/strict", json={"day": "2026-11-21"})
+    assert res.status_code == 200
+    assert res.json() == {"day": "2026-11-21"}

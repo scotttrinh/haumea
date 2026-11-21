@@ -28,7 +28,12 @@ from typing import Annotated, Any, get_args, get_origin, overload
 
 import msgspec
 
-from haumea._pydantic import is_pydantic_model
+from haumea._pydantic import (
+    is_pydantic_model,
+    pydantic_adapter,
+    validate_json,
+    validate_python,
+)
 from haumea.exceptions import RequestValidationError
 from haumea.requests import Request
 from haumea.security import HTTPBearer
@@ -226,6 +231,8 @@ class Field:
     embed: bool = False
     """A body field that is one key of a JSON object, because its function
     has several body fields; otherwise it decodes the whole body."""
+    adapter: Any = None
+    """Cached ``pydantic.TypeAdapter`` for Pydantic-backed annotations."""
 
     @property
     def required(self) -> bool:
@@ -447,7 +454,12 @@ class Endpoint:
                 )
             elif field.source == "body" and not field.embed:
                 # Decode and validate straight from the bytes, in one pass.
-                value = _decode_body(await request.body(), field.annotation, errors)
+                value = _decode_body(
+                    await request.body(),
+                    field.annotation,
+                    errors,
+                    adapter=field.adapter,
+                )
                 kwargs[field.name] = _or_default(field, value, ["body"], errors)
             elif field.source == "body":
                 raw = (
@@ -504,9 +516,17 @@ def _error(loc: list[Any], exc: msgspec.MsgspecError) -> dict[str, Any]:
     return {"loc": loc, "msg": msg}
 
 
-def _decode_body(raw: bytes, annotation: Any, errors: list[dict[str, Any]]) -> Any:
+def _decode_body(
+    raw: bytes,
+    annotation: Any,
+    errors: list[dict[str, Any]],
+    *,
+    adapter: Any = None,
+) -> Any:
     if not raw:
         return _MISSING
+    if adapter is not None:
+        return validate_json(adapter, raw, ["body"], errors)
     try:
         return msgspec.json.decode(raw, type=annotation)
     except msgspec.MsgspecError as exc:
@@ -530,6 +550,8 @@ def _convert(
     loc = [field.source, field.alias]
     if raw is _MISSING:
         return _or_default(field, raw, loc, errors)
+    if field.adapter is not None:
+        return validate_python(field.adapter, raw, loc, strict=strict, errors=errors)
     try:
         return msgspec.convert(raw, field.annotation, strict=strict)
     except msgspec.MsgspecError as exc:
@@ -591,4 +613,6 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
     alias = marker.alias if isinstance(marker, ParamInfo) and marker.alias else name
     if source == "header" and alias == name:
         alias = name.replace("_", "-")
-    return Field(name, source, alias, declared, default)
+    return Field(
+        name, source, alias, declared, default, adapter=pydantic_adapter(declared)
+    )

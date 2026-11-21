@@ -21,9 +21,11 @@ Haumea infers each handler parameter's source, coercion rules, and dependencies 
 
 Fields are planned per function: [[src/haumea/params.py#Endpoint]] marks a function's body fields `embed` when it has more than one.
 
-- **Single body field**: Decodes and validates raw request bytes directly into the field's annotation via [[src/haumea/params.py#_decode_body]] in a single `msgspec.json.decode` pass.
-- **Multiple body fields**: Decodes the request body once as `dict[str, Any]` and validates each field by alias using `strict=True` in [[src/haumea/params.py#_convert]].
-- **Path, query, header, and cookie**: Values arrive as strings, so [[src/haumea/params.py#_convert]] runs `msgspec.convert(..., strict=False)` for lenient coercion (e.g. `"7"` -> `int`). Non-list query parameters take the last value when repeated. Cookie fields read [[src/haumea/requests.py#Request#cookies]] by `alias` (the parameter name unless set), and OpenAPI documents them as `in: cookie`.
+- **Single body field**: Decodes and validates raw request bytes directly into the field's annotation via [[src/haumea/params.py#_decode_body]] in a single `msgspec.json.decode` pass, or via [[src/haumea/_pydantic.py#validate_json]] when [[src/haumea/params.py#Field]] holds a cached `pydantic.TypeAdapter`.
+- **Multiple body fields**: Decodes the request body once as `dict[str, Any]` and validates each field by alias using `strict=True` in [[src/haumea/params.py#_convert]] (`msgspec.convert` or [[src/haumea/_pydantic.py#validate_python]]).
+- **Path, query, header, and cookie**: Values arrive as strings, so [[src/haumea/params.py#_convert]] runs lenient coercion (`strict=False`, e.g. `"7"` -> `int`) through `msgspec.convert` or [[src/haumea/_pydantic.py#validate_python]]. Non-list query parameters take the last value when repeated. Cookie fields read [[src/haumea/requests.py#Request#cookies]] by `alias` (the parameter name unless set), and OpenAPI documents them as `in: cookie`.
+
+When a field's annotation is or wraps a `pydantic.BaseModel` (checked lazily via [[src/haumea/_pydantic.py#contains_pydantic_model]]), [[src/haumea/params.py#_field]] caches a `pydantic.TypeAdapter` on [[src/haumea/params.py#Field]] via [[src/haumea/_pydantic.py#pydantic_adapter]] at [[src/haumea/params.py#Endpoint]] construction time rather than per request. Empty bodies still flow through [[src/haumea/params.py#_or_default]] so required/default semantics match `msgspec` fields.
 
 ## Dependencies and Execution
 
@@ -55,7 +57,7 @@ Dependencies declare a credential scheme with [[src/haumea/security.py#HTTPBeare
 
 All conversion and decoding failures are collected into a list of `{"loc": [...], "msg": ...}` dictionaries and raised as [[src/haumea/exceptions.py#RequestValidationError]] (`422`).
 
-[[src/haumea/params.py#_error]] parses `msgspec`'s `- at $.path` error suffix and appends object keys and array indices to `loc`, giving field-level error locations even for nested `Struct` constraints.
+[[src/haumea/params.py#_error]] parses `msgspec`'s `- at $.path` error suffix and appends object keys and array indices to `loc`, giving field-level error locations even for nested `Struct` constraints. For Pydantic-backed fields, [[src/haumea/_pydantic.py#_format_errors]] maps each `pydantic.ValidationError.errors()` entry (including malformed JSON) into `{"loc": [*loc, *err["loc"]], "msg": err["msg"]}`.
 
 ## Request Cookies
 
