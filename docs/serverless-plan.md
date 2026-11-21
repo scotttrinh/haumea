@@ -159,6 +159,34 @@ Each step should land as its own reviewable change with its tests. When a step c
 
 ---
 
+## Phase 4.1: Lazy Pydantic model support
+
+**Goal:** accept and return `pydantic.BaseModel` instances (and standard containers of them) seamlessly in handlers, dependencies, responses, and OpenAPI without adding `pydantic` as a core dependency or regressing `msgspec`-only cold starts and `_vendor/` tree-shaking.
+
+### 4.1.1 Lazy Pydantic helper and model detection (§6.8)
+
+- **What:** add a small lazy Pydantic helper (checking `sys.modules.get("pydantic")` so `pydantic` is never imported unless already loaded by user code) and update `_is_model` in `params.py` so `BaseModel` subclasses infer `source = "body"`.
+- **Tests:**
+  - Importing `haumea` and running `msgspec`-only routes does not import `pydantic`.
+  - A `BaseModel` parameter without `Body()` infers `source = "body"`.
+
+### 4.1.2 Validation, error mapping, and `TypeAdapter` caching (§6.8)
+
+- **What:** cache `pydantic.TypeAdapter` on `Field` at `Endpoint` construction for Pydantic-backed annotations (direct `BaseModel`, `list[Model]`, `Model | None`, `Annotated[Model, ...]`), decode single-body fields with `validate_json` and embedded/string-sourced fields with `validate_python(..., strict=strict)`, and map `pydantic.ValidationError.errors()` to Haumea's `422` `RequestValidationError` `{"loc": [...], "msg": ...}` shape.
+- **Tests:**
+  - Single `BaseModel` body, multiple embedded `BaseModel` fields, optional/defaulted `BaseModel` with empty body, and `list[BaseModel]` all validate and bind.
+  - Invalid payloads return `422` with field-level `loc` paths (including nested fields and array indices).
+
+### 4.1.3 Response serialization and OpenAPI schemas (§6.8)
+
+- **What:** wire an `enc_hook` into `msgspec.json.encode` in `JSONResponse.render` and `ServerSentEvent.encode` for `BaseModel` instances, and update `openapi.py#_schema` to emit `TypeAdapter(annotation).json_schema(ref_template=_REF)` and merge `$defs` into `components.schemas`.
+- **Tests:**
+  - Returning a `BaseModel` (or `list[BaseModel]` / `SSEResponse` yielding `BaseModel`) serializes to JSON.
+  - `/openapi.json` and `haumea build` static `openapi.json` include `BaseModel` request/response schemas and nested `$defs` under `components.schemas`.
+  - Add `pydantic` only to the `dev` dependency group in `pyproject.toml`; existing build tests still verify that routes not importing `pydantic` omit it from `_vendor/`.
+
+---
+
 ## Phase 5: Background work
 
 **Goal:** run post-response work locally in dev/tests and via `wait_until` in deployed functions once `vercel-functions` exports `vercel.functions.wait_until`.
