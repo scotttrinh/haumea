@@ -1,7 +1,8 @@
 """Work out a handler's inputs from its signature.
 
 - a parameter named like a path segment (``[item_id]``) comes from the path
-- a model (msgspec ``Struct``, dataclass or attrs class) comes from the JSON body
+- a model (msgspec ``Struct``, dataclass, attrs class, or pydantic
+  ``BaseModel``) comes from the JSON body
 - a ``Request`` annotation receives the request
 - ``Depends(fn)`` is the result of calling ``fn``, resolved the same way
 - anything else is a query parameter
@@ -27,6 +28,7 @@ from typing import Annotated, Any, get_args, get_origin, overload
 
 import msgspec
 
+from haumea._pydantic import is_pydantic_model
 from haumea.exceptions import RequestValidationError
 from haumea.requests import Request
 from haumea.security import HTTPBearer
@@ -540,6 +542,7 @@ def _is_model(annotation: Any) -> bool:
         issubclass(annotation, msgspec.Struct)
         or dataclasses.is_dataclass(annotation)
         or hasattr(annotation, "__attrs_attrs__")
+        or is_pydantic_model(annotation)
     )
 
 

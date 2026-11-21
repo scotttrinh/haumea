@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 import warnings
 import weakref
@@ -32,6 +33,7 @@ from haumea import (
     HTTPBearer,
     HTTPException,
     JSONResponse,
+    Query,
     Request,
     Response,
     ServerSentEvent,
@@ -5342,3 +5344,110 @@ def test_checks_returning_generators_fail_closed():
         response = make_client(app)("GET", "/")
         assert response.status_code == 500
         assert "handler" not in calls
+
+
+# @lat: [[tests#Lazy Pydantic model detection#Msgspec routes never import pydantic]]
+def test_msgspec_routes_do_not_import_pydantic():
+    script = """
+import asyncio
+import sys
+from typing import Any
+
+import httpx
+import msgspec
+
+attempts: list[str] = []
+
+
+class BlockPydantic:
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "pydantic" or fullname.startswith("pydantic."):
+            attempts.append(fullname)
+            raise AssertionError(f"unexpected import attempt: {fullname}")
+        return None
+
+
+sys.meta_path.insert(0, BlockPydantic())
+
+from haumea import Haumea
+
+
+class Item(msgspec.Struct):
+    name: str
+
+
+def create(item: Item, limit: int = 10) -> dict[str, Any]:
+    return {"name": item.name, "limit": limit}
+
+
+async def main() -> None:
+    app = Haumea()
+    app.add_route("/items", create, methods=["POST"])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        post = await http.post("/items?limit=5", json={"name": "widget"})
+        assert post.status_code == 200
+        assert post.json() == {"name": "widget", "limit": 5}
+        schema = await http.get("/openapi.json")
+        assert schema.status_code == 200
+
+
+asyncio.run(main())
+assert not attempts
+assert "pydantic" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# @lat: [[tests#Lazy Pydantic model detection#BaseModel parameter infers body source]]
+def test_pydantic_basemodel_infers_body_source(monkeypatch):
+    fake_pydantic = types.ModuleType("pydantic")
+
+    class BaseModel:
+        pass
+
+    fake_pydantic.__dict__["BaseModel"] = BaseModel
+    monkeypatch.setitem(sys.modules, "pydantic", fake_pydantic)
+
+    class Payload(BaseModel):
+        title: str
+
+    class Plain:
+        pass
+
+    def plain_model(payload: Payload) -> dict[str, Any]:
+        return {}
+
+    def annotated_model(payload: Annotated[Payload, "meta"]) -> dict[str, Any]:
+        return {}
+
+    def explicit_query(payload: Annotated[Payload, Query()]) -> dict[str, Any]:
+        return {}
+
+    def plain_class(plain: Plain) -> dict[str, Any]:
+        return {}
+
+    app = Haumea(docs=False)
+    app.add_route("/plain", plain_model, methods=["POST"])
+    app.add_route("/annotated", annotated_model, methods=["POST"])
+    app.add_route("/query", explicit_query, methods=["POST"])
+    app.add_route("/non-model", plain_class, methods=["POST"])
+    client = make_client(app)
+
+    for path, expected_loc in (
+        ("/plain", ["body"]),
+        ("/annotated", ["body"]),
+        ("/query", ["query", "payload"]),
+        ("/non-model", ["query", "plain"]),
+    ):
+        response = client("POST", path)
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": [{"loc": expected_loc, "msg": "Field required"}]
+        }

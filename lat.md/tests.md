@@ -527,3 +527,15 @@ Verify that after the initiating caller is cancelled and dropped and `gc.collect
 ### Abandoned waiter after failure
 
 Verify that when a cancelled caller's creation later fails, an active caller still gets the error and asyncio logs no unretrieved-exception error after `gc.collect()`.
+
+## Lazy Pydantic model detection
+
+Tests for [[src/haumea/_pydantic.py#is_pydantic_model]] and [[src/haumea/params.py#_is_model]] body-source inference without importing `pydantic`.
+
+### Msgspec routes never import pydantic
+
+Verify in a fresh subprocess with a rejecting `sys.meta_path` finder installed before `import haumea` that serving a `msgspec.Struct` route and generating `/openapi.json` never attempt to import `pydantic` and leave it out of `sys.modules`.
+
+### BaseModel parameter infers body source
+
+Verify over HTTP that unmarked and `Annotated` `pydantic.BaseModel` parameters report missing-input `422` errors at `["body"]`, while explicit `Query()` overrides and plain classes report missing-input `422` errors at `["query", ...]`.

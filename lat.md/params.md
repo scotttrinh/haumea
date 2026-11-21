@@ -10,8 +10,10 @@ Haumea infers each handler parameter's source, coercion rules, and dependencies 
 2. A [[src/haumea/requests.py#Request]] annotation receives the raw request (`request`).
 3. Explicit [[src/haumea/params.py#Query]], [[src/haumea/params.py#Header]], [[src/haumea/params.py#Cookie]], or [[src/haumea/params.py#Body]] markers override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set.
 4. A parameter name matching a route `{segment}` comes from `path`.
-5. A model type ([[src/haumea/params.py#_is_model]]: `msgspec.Struct`, `dataclass`, or `attrs` class) comes from `body`.
+5. A model type ([[src/haumea/params.py#_is_model]]: `msgspec.Struct`, `dataclass`, `attrs` class, or `pydantic.BaseModel` via [[src/haumea/_pydantic.py#is_pydantic_model]]) comes from `body`.
 6. Everything else defaults to `query`.
+
+[[src/haumea/_pydantic.py#pydantic_module]] inspects `sys.modules.get("pydantic")` without importing `pydantic`, so `BaseModel` detection adds no import or runtime dependency when user code has not loaded `pydantic`.
 
 ## Body Decoding and Conversion
 
