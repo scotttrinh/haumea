@@ -33,7 +33,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from haumea.app import ErrorHandler, Haumea, Middleware
+from haumea.app import AfterBackend, ErrorHandler, Haumea, Middleware
 from haumea.config import normalize_base_path, project_base_path
 from haumea.params import is_generator_callable
 
@@ -261,7 +261,11 @@ def create_app(
 
 
 def create_route_app(
-    app_dir: str | Path, function: str, *, base_path: str | None = None
+    app_dir: str | Path,
+    function: str,
+    *,
+    base_path: str | None = None,
+    after_backend: AfterBackend = "local",
 ) -> Haumea:
     """Build the single-route app that runs inside one deployed function.
 
@@ -270,7 +274,7 @@ def create_route_app(
     """
     if base_path is None:
         base_path = project_base_path(app_dir)
-    app = Haumea(docs=False, base_path=base_path)
+    app = Haumea(docs=False, base_path=base_path, after_backend=after_backend)
     for route in discover_routes(app_dir, app.base_path):
         if route.function == function:
             _add_route(app, route)

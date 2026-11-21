@@ -1,4 +1,4 @@
-from haumea.app import Haumea
+from haumea.app import Haumea, after
 from haumea.config import HaumeaConfig, load_config
 from haumea.exceptions import HTTPException, RequestValidationError
 from haumea.params import Body, Cookie, Depends, Header, Query, lazy, raises
@@ -37,6 +37,7 @@ __all__ = [
     "SSEResponse",
     "ServerSentEvent",
     "StreamingResponse",
+    "after",
     "create_app",
     "create_route_app",
     "lazy",

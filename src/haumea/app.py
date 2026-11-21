@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
+import importlib
 import inspect
 import mimetypes
 import re
 import sys
 import traceback
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from haumea.config import normalize_base_path
 from haumea.exceptions import HTTPException, RequestValidationError
@@ -22,6 +26,99 @@ _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 CallNext = Callable[[Request], Awaitable[Response]]
 Middleware = Callable[[Request, CallNext], Awaitable[Response]]
 ErrorHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
+AfterBackend = Literal["local", "wait_until"]
+
+_AFTER_BACKENDS = ("local", "wait_until")
+
+
+class _AfterState:
+    """Per-request ``after()`` state; closing it blocks detached or nested calls."""
+
+    __slots__ = ("backend", "closed", "tasks")
+
+    def __init__(self, backend: AfterBackend) -> None:
+        self.backend = backend
+        self.closed = False
+        self.tasks: list[Callable[[], Awaitable[None]]] = []
+
+    def schedule(self, task: Callable[[], Awaitable[None]]) -> None:
+        if self.closed:
+            raise RuntimeError("after() can only be called while handling a request")
+        if self.backend == "wait_until":
+            functions = importlib.import_module("vercel.functions")
+            functions.wait_until(task())
+        else:
+            self.tasks.append(task)
+
+    def close_and_take(self) -> list[Callable[[], Awaitable[None]]]:
+        self.closed = True
+        tasks = self.tasks
+        self.tasks = []
+        return tasks
+
+
+_after_state: ContextVar[_AfterState | None] = ContextVar(
+    "haumea_after_state", default=None
+)
+
+
+def after(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
+    """Schedule ``fn(*args, **kwargs)`` to run after the response is sent.
+
+    ``fn`` may be sync or async; sync callables run in a worker thread via
+    ``asyncio.to_thread``. Must be called while handling a request, otherwise
+    raises ``RuntimeError``. Exceptions are logged to ``stderr`` and never
+    reach the client.
+    """
+    state = _after_state.get()
+    if state is None or state.closed:
+        raise RuntimeError("after() can only be called while handling a request")
+    if not callable(fn):
+        raise TypeError(f"after() requires a callable, got {fn!r}")
+    state.schedule(_make_after_task(fn, args, kwargs))
+
+
+def _make_after_task(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Callable[[], Awaitable[None]]:
+    """Bind ``fn(*args, **kwargs)`` into an isolated coroutine factory."""
+    call = functools.partial(fn, *args, **kwargs) if (args or kwargs) else fn
+    is_async = _is_async(fn)
+
+    async def run() -> None:
+        outer_cancelled = False
+
+        async def invoke() -> None:
+            try:
+                if is_async:
+                    await call()
+                else:
+                    result = await asyncio.to_thread(call)
+                    if inspect.isawaitable(result):
+                        await result
+            except asyncio.CancelledError as exc:
+                if not outer_cancelled:
+                    traceback.print_exception(exc, file=sys.stderr)
+            except Exception as exc:
+                traceback.print_exception(exc, file=sys.stderr)
+
+        token = _after_state.set(None)
+        try:
+            child = asyncio.create_task(invoke())
+            try:
+                await asyncio.shield(child)
+            except asyncio.CancelledError:
+                outer_cancelled = True
+                child.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await child
+                raise
+        finally:
+            _after_state.reset(token)
+
+    return run
 
 
 def error_response(exc: Exception) -> Response:
@@ -46,7 +143,7 @@ def _call_sync_handler(handler: ErrorHandler, request: Request, exc: Exception) 
         return handler(request, exc)
 
 
-def _is_async(handler: ErrorHandler) -> bool:
+def _is_async(handler: Callable[..., Any]) -> bool:
     """An ``async def`` function or an instance with ``async def __call__``."""
     return inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
         type(handler).__call__
@@ -127,12 +224,19 @@ class Haumea:
         docs: bool = True,
         public_dir: str | Path | None = None,
         base_path: str = "",
+        after_backend: AfterBackend = "local",
     ) -> None:
+        if after_backend not in _AFTER_BACKENDS:
+            raise ValueError(
+                f"unknown after_backend {after_backend!r}: "
+                f"expected one of {_AFTER_BACKENDS}"
+            )
         self.title = title
         self.base_path = normalize_base_path(base_path)
         self.version = version
         self.docs = docs
         self.public_dir = Path(public_dir).resolve() if public_dir else None
+        self.after_backend: AfterBackend = after_backend
         self.routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]] = []
         self.hidden_operations: set[tuple[str, str]] = set()
         """``(path, method)`` pairs served but left out of the OpenAPI schema."""
@@ -195,11 +299,24 @@ class Haumea:
             return
 
         request = Request(scope, receive)
+        after_state = _AfterState(self.after_backend)
+        token = _after_state.set(after_state)
+        cancelled = False
         try:
-            response = await self._handle(request)
-        except Exception as exc:  # unmatched paths and middleware errors
-            response = error_response(exc)
-        await response(receive, send, include_body=request.method != "HEAD")
+            try:
+                response = await self._handle(request)
+            except Exception as exc:  # unmatched paths and middleware errors
+                response = error_response(exc)
+            await response(receive, send, include_body=request.method != "HEAD")
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            tasks = after_state.close_and_take()
+            _after_state.reset(token)
+            if not cancelled:
+                for task in tasks:
+                    await task()
 
     async def _handle(self, request: Request) -> Response:
         """Match in Build Output order: literal routes, then docs and

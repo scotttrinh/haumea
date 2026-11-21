@@ -73,7 +73,7 @@ SIZE_LIMIT_BYTES = 500 * 1024 * 1024
 ALWAYS_INCLUDED: tuple[str, ...] = (
     "haumea",
     "vercel-runtime",
-    "vercel-functions",
+    "vercel",
 )
 
 IGNORE = shutil.ignore_patterns(
@@ -89,6 +89,7 @@ app = create_route_app(
     os.path.join(os.path.dirname(__file__), "app"),
     {function!r},
     base_path={base_path!r},
+    after_backend="wait_until",
 )
 """
 
@@ -205,6 +206,7 @@ def _install_dependencies(
             "-r",
             str(requirements),
             "vercel-runtime",
+            "vercel>=0.10.0",
         ]
         if platform:
             cmd += ["--python-platform", platform]

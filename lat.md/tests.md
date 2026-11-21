@@ -168,7 +168,7 @@ Checks mutable `regions` isolation, mixed dict keys, and values whose `__deepcop
 
 ## Build output layout
 
-Verify `.vercel/output` `config.json` rewrites, static `docs.html`/`openapi.json`/`public/` files, per-route `.func` directories, `.vc-config.json` `maxDuration` overrides, and `_vendor` contents (including omitting `pydantic` and `uvicorn`).
+Verify `.vercel/output` `config.json` rewrites, static docs/assets, per-route `.func` directories, `.vc-config.json` overrides, and `_vendor` contents (`haumea`, `msgspec`, `vercel`, and no `uvicorn`).
 
 ## Built function invocation
 
@@ -238,7 +238,7 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 
 Verify [[src/haumea/build.py#_trace_function_chains]], [[src/haumea/build.py#_resolve_closure_with_reasons]], [[src/haumea/build.py#ALWAYS_INCLUDED]], and [[src/haumea/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
-Covers `vercel-functions` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
+Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
 ## Segment files as trace roots
 
@@ -579,3 +579,35 @@ Verify that same-named `msgspec.Struct` and `pydantic.BaseModel` models (includi
 ### Response serialization schema mode
 
 Verify that `BaseModel`s with `@field_serializer`, `Field(alias=...)`, and `ConfigDict(serialize_by_alias=True)` emit validation request schemas and serialization response schemas matching the JSON returned over HTTP.
+
+## Background work with after()
+
+Tests for [[src/haumea/app.py#after]], `after_backend` selection, and build wiring for `vercel.functions.wait_until`.
+
+### Runs after response body
+
+Verify over ASGI that sync and async tasks scheduled via [[src/haumea/app.py#after]] (including a `fn` keyword argument) run after the final `http.response.body` (`more_body=False`) is sent, sync tasks run in a worker thread, and nested calls raise `RuntimeError`.
+
+### Logs exceptions safely
+
+Verify that exceptions and callback-raised `asyncio.CancelledError` in [[src/haumea/app.py#after]] tasks are logged to `stderr`, never affect the client response, and do not stop subsequent scheduled tasks from running.
+
+### Outside request raises RuntimeError
+
+Verify that calling [[src/haumea/app.py#after]] outside an active request or from a detached task after request completion raises `RuntimeError`.
+
+### Runs on disconnect and send error
+
+Verify that queued local [[src/haumea/app.py#after]] tasks still run after a streaming `http.disconnect` and after a send-side `BrokenPipeError` while letting `BrokenPipeError` propagate.
+
+### Cancellation and callback GC
+
+Verify that outer request cancellation skips queued local callbacks, cancels a running callback without letting a swallowed `CancelledError` suppress cancellation, and releases callback payloads for GC while a detached task lives.
+
+### wait_until backend and backend validation
+
+Verify invalid `after_backend` values raise `ValueError`, `"local"` never imports `vercel`, and `"wait_until"` lazily passes wrapped awaitables to `vercel.functions.wait_until` while blocking nested `after()` even in copied registration contexts.
+
+### Build entrypoint and vercel install
+
+Verify [[src/haumea/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/haumea/build.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
