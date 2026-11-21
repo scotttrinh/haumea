@@ -534,7 +534,7 @@ Tests for [[src/haumea/_pydantic.py#is_pydantic_model]] and [[src/haumea/params.
 
 ### Msgspec routes never import pydantic
 
-Verify in a fresh subprocess with a rejecting `sys.meta_path` finder installed before `import haumea` that serving a `msgspec.Struct` route and generating `/openapi.json` never attempt to import `pydantic` and leave it out of `sys.modules`.
+Verify in a fresh subprocess with a rejecting `sys.meta_path` finder that serving a `msgspec.Struct` JSON route, an `SSEResponse` route, and `/openapi.json` never import `pydantic`.
 
 ### BaseModel parameter infers body source
 
@@ -559,3 +559,23 @@ Verify that `pydantic.TypeAdapter` is built once per Pydantic-backed field at ro
 ### Specialized TypeAliasType and strict JSON
 
 Verify that a specialized `TypeAliasType` wrapping a `BaseModel` (`type Payload[T] = tuple[T, Item]`) caches a `TypeAdapter` and binds over HTTP, and that a strict `BaseModel` `date` field validates via `validate_json(raw)` from raw JSON bytes.
+
+## Pydantic responses and OpenAPI
+
+Tests for lazy `pydantic.BaseModel` JSON/SSE response serialization and OpenAPI 3.1 schema generation in dev and build outputs.
+
+### JSON and SSE serialization
+
+Verify over HTTP that returning a `BaseModel`, `list[BaseModel]`, `dict[str, BaseModel]`, a `Struct` holding a `BaseModel`, and `SSEResponse` yielding `BaseModel` serialize to JSON, while unsupported objects still raise `TypeError`.
+
+### Dev and build OpenAPI schemas
+
+Verify dev `/openapi.json` and the emitted `build()` `static/openapi.json` on disk match and emit `BaseModel` request/response schemas (including `Annotated`, `list`, and `| None`) with `$defs` hoisted into `components.schemas`.
+
+### Component name collisions
+
+Verify that same-named `msgspec.Struct` and `pydantic.BaseModel` models (including discriminated union members) keep distinct `components.schemas` entries with rewritten `$ref` and `discriminator.mapping` targets.
+
+### Response serialization schema mode
+
+Verify that `BaseModel`s with `@field_serializer`, `Field(alias=...)`, and `ConfigDict(serialize_by_alias=True)` emit validation request schemas and serialization response schemas matching the JSON returned over HTTP.

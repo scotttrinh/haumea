@@ -5369,7 +5369,7 @@ class BlockPydantic:
 
 sys.meta_path.insert(0, BlockPydantic())
 
-from haumea import Haumea
+from haumea import Haumea, SSEResponse
 
 
 class Item(msgspec.Struct):
@@ -5380,14 +5380,22 @@ def create(item: Item, limit: int = 10) -> dict[str, Any]:
     return {"name": item.name, "limit": limit}
 
 
+def stream() -> SSEResponse:
+    return SSEResponse([Item(name="tick")])
+
+
 async def main() -> None:
     app = Haumea()
     app.add_route("/items", create, methods=["POST"])
+    app.add_route("/events", stream, methods=["GET"])
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         post = await http.post("/items?limit=5", json={"name": "widget"})
         assert post.status_code == 200
         assert post.json() == {"name": "widget", "limit": 5}
+        events = await http.get("/events")
+        assert events.status_code == 200
+        assert 'data: {"name":"tick"}\\n\\n' in events.text
         schema = await http.get("/openapi.json")
         assert schema.status_code == 200
 
@@ -5735,3 +5743,465 @@ def test_pydantic_specialized_type_alias_and_strict_json_mode():
     res = client("POST", "/strict", json={"day": "2026-11-21"})
     assert res.status_code == 200
     assert res.json() == {"day": "2026-11-21"}
+
+
+# @lat: [[tests#Pydantic responses and OpenAPI#JSON and SSE serialization]]
+def test_pydantic_response_and_sse_serialization():
+    from datetime import date
+
+    from pydantic import BaseModel
+
+    class Tag(BaseModel):
+        label: str
+
+    class Item(BaseModel):
+        name: str
+        created: date
+        tags: list[Tag] = []
+
+    class Envelope(msgspec.Struct):
+        ok: bool
+        item: Item
+
+    sample = Item(name="alpha", created=date(2026, 11, 21), tags=[Tag(label="v1")])
+    expected = {
+        "name": "alpha",
+        "created": "2026-11-21",
+        "tags": [{"label": "v1"}],
+    }
+
+    def single() -> Item:
+        return sample
+
+    def many() -> list[Item]:
+        return [sample]
+
+    def mapping() -> dict[str, Item]:
+        return {"first": sample}
+
+    def wrapped() -> Envelope:
+        return Envelope(ok=True, item=sample)
+
+    def events() -> SSEResponse:
+        return SSEResponse(
+            [
+                sample,
+                ServerSentEvent(data=Envelope(ok=True, item=sample), event="wrapped"),
+            ]
+        )
+
+    app = Haumea(docs=False)
+    app.add_route("/single", single, methods=["GET"])
+    app.add_route("/many", many, methods=["GET"])
+    app.add_route("/mapping", mapping, methods=["GET"])
+    app.add_route("/wrapped", wrapped, methods=["GET"])
+    app.add_route("/events", events, methods=["GET"])
+    client = make_client(app)
+
+    res = client("GET", "/single")
+    assert res.status_code == 200
+    assert res.json() == expected
+
+    res = client("GET", "/many")
+    assert res.status_code == 200
+    assert res.json() == [expected]
+
+    res = client("GET", "/mapping")
+    assert res.status_code == 200
+    assert res.json() == {"first": expected}
+
+    res = client("GET", "/wrapped")
+    assert res.status_code == 200
+    assert res.json() == {"ok": True, "item": expected}
+
+    res = client("GET", "/events")
+    assert res.status_code == 200
+    frames = [frame for frame in res.text.split("\n\n") if frame]
+    assert len(frames) == 2
+    assert json.loads(frames[0].removeprefix("data: ")) == expected
+    event_line, data_line = frames[1].splitlines()
+    assert event_line == "event: wrapped"
+    assert json.loads(data_line.removeprefix("data: ")) == {
+        "ok": True,
+        "item": expected,
+    }
+
+    with pytest.raises(TypeError):
+        JSONResponse(object())
+
+
+# @lat: [[tests#Pydantic responses and OpenAPI#Dev and build OpenAPI schemas]]
+def test_pydantic_openapi_dev_and_build(tmp_path, isolated_imports, monkeypatch):
+    monkeypatch.setattr(build_module, "_install_dependencies", lambda *args: None)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    project = tmp_path / "pydantic_openapi_app"
+    (project / "app" / "orders").mkdir(parents=True)
+    (project / "app" / "ping").mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "pydantic-openapi-app"\nversion = "0.1.0"\n'
+    )
+    (project / "app" / "orders" / "route.py").write_text(
+        """
+from typing import Annotated
+
+from pydantic import BaseModel, Field
+
+from haumea import Body
+
+
+class Tag(BaseModel):
+    label: str
+
+
+class Item(BaseModel):
+    name: str
+    tags: list[Tag] = []
+
+
+class Order(BaseModel):
+    id: int
+    items: list[Item]
+
+
+def POST(
+    order: Annotated[Order, Field(description="Order to create")],
+    notes: Annotated[Item | None, Body()] = None,
+) -> list[Item]:
+    \"\"\"Create an order.\"\"\"
+    return order.items
+
+
+def PUT(items: Annotated[list[Item], Body()]) -> Order:
+    \"\"\"Replace order items.\"\"\"
+    return Order(id=1, items=items)
+"""
+    )
+    (project / "app" / "ping" / "route.py").write_text(
+        """
+import msgspec
+
+
+class Pong(msgspec.Struct):
+    ok: bool
+
+
+def GET() -> Pong:
+    return Pong(ok=True)
+"""
+    )
+
+    app = create_app(project / "app", title=project.name)
+    client = make_client(app)
+    dev_res = client("GET", "/openapi.json")
+    assert dev_res.status_code == 200
+    dev_schema = dev_res.json()
+
+    built = build(project, platform=None)
+    openapi_file = built / "static" / "openapi.json"
+    assert openapi_file.is_file()
+    build_schema = json.loads(openapi_file.read_text())
+    assert build_schema == dev_schema
+
+    components = dev_schema["components"]["schemas"]
+    assert {"Order", "Item", "Tag", "Pong"} <= set(components)
+    assert components["Order"]["properties"]["items"]["items"] == {
+        "$ref": "#/components/schemas/Item"
+    }
+    assert components["Item"]["properties"]["tags"]["items"] == {
+        "$ref": "#/components/schemas/Tag"
+    }
+
+    post_op = dev_schema["paths"]["/orders"]["post"]
+    post_body = post_op["requestBody"]["content"]["application/json"]["schema"]
+    assert "$defs" not in post_body
+    assert post_body["properties"]["order"]["$ref"] == "#/components/schemas/Order"
+    assert post_body["properties"]["notes"]["anyOf"] == [
+        {"$ref": "#/components/schemas/Item"},
+        {"type": "null"},
+    ]
+    post_resp = post_op["responses"]["200"]["content"]["application/json"]["schema"]
+    assert "$defs" not in post_resp
+    assert post_resp == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/Item"},
+    }
+
+    put_op = dev_schema["paths"]["/orders"]["put"]
+    put_body = put_op["requestBody"]["content"]["application/json"]["schema"]
+    assert "$defs" not in put_body
+    assert put_body == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/Item"},
+    }
+    put_resp = put_op["responses"]["200"]["content"]["application/json"]["schema"]
+    assert "$defs" not in put_resp
+    assert put_resp["properties"]["items"]["items"] == {
+        "$ref": "#/components/schemas/Item"
+    }
+
+    ping_resp = dev_schema["paths"]["/ping"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert ping_resp == {"$ref": "#/components/schemas/Pong"}
+
+
+# @lat: [[tests#Pydantic responses and OpenAPI#Component name collisions]]
+def test_pydantic_openapi_component_collisions():
+    from pydantic import BaseModel
+
+    def make_struct_route() -> Any:
+        class Payload(msgspec.Struct):
+            struct_field: int
+
+        def route(body: Payload) -> Payload:
+            return body
+
+        return route
+
+    def make_model_route() -> Any:
+        class Payload(BaseModel):
+            model_field: str
+
+        def route(body: Annotated[list[Payload], Body()]) -> list[Payload]:
+            return body
+
+        return route
+
+    def make_other_model_route() -> Any:
+        class Payload(BaseModel):
+            other_field: bool
+
+        def route(body: Annotated[list[Payload], Body()]) -> list[Payload]:
+            return body
+
+        return route
+
+    app = Haumea()
+    app.add_route("/struct", make_struct_route(), methods=["POST"])
+    app.add_route("/model", make_model_route(), methods=["POST"])
+    app.add_route("/other", make_other_model_route(), methods=["POST"])
+    client = make_client(app)
+
+    res = client("GET", "/openapi.json")
+    assert res.status_code == 200
+    doc = res.json()
+    schemas = doc["components"]["schemas"]
+
+    def resolve(ref_schema: dict[str, Any]) -> dict[str, Any]:
+        ref = ref_schema["$ref"]
+        name = ref.removeprefix("#/components/schemas/")
+        return schemas[name]
+
+    struct_ref = doc["paths"]["/struct"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    model_ref = doc["paths"]["/model"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["items"]
+    other_ref = doc["paths"]["/other"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["items"]
+
+    assert len({struct_ref["$ref"], model_ref["$ref"], other_ref["$ref"]}) == 3
+    assert set(resolve(struct_ref)["properties"]) == {"struct_field"}
+    assert set(resolve(model_ref)["properties"]) == {"model_field"}
+    assert set(resolve(other_ref)["properties"]) == {"other_field"}
+
+    # Discriminated union mapping must also rewrite when a member collides.
+    def make_struct_pet_route() -> Any:
+        class Pet(msgspec.Struct):
+            species: str
+
+        def route(body: Pet) -> Pet:
+            return body
+
+        return route
+
+    def make_union_route() -> Any:
+        from typing import Literal
+
+        from pydantic import Field
+
+        class Pet(BaseModel):
+            kind: Literal["pet"]
+            name: str
+
+        class Toy(BaseModel):
+            kind: Literal["toy"]
+            title: str
+
+        def route(
+            body: Annotated[Pet | Toy, Field(discriminator="kind"), Body()],
+        ) -> dict[str, Any]:
+            return body.model_dump(mode="json")
+
+        return route
+
+    union_app = Haumea()
+    union_app.add_route("/struct-pet", make_struct_pet_route(), methods=["POST"])
+    union_app.add_route("/union", make_union_route(), methods=["POST"])
+    union_doc = make_client(union_app)("GET", "/openapi.json").json()
+    union_schemas = union_doc["components"]["schemas"]
+
+    struct_pet_ref = union_doc["paths"]["/struct-pet"]["post"]["requestBody"][
+        "content"
+    ]["application/json"]["schema"]["$ref"]
+    union_body = union_doc["paths"]["/union"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    pet_mapping_ref = union_body["discriminator"]["mapping"]["pet"]
+    one_of_refs = {entry["$ref"] for entry in union_body["oneOf"]}
+
+    assert pet_mapping_ref != struct_pet_ref
+    assert pet_mapping_ref in one_of_refs
+    assert set(
+        union_schemas[struct_pet_ref.removeprefix("#/components/schemas/")][
+            "properties"
+        ]
+    ) == {"species"}
+    assert set(
+        union_schemas[pet_mapping_ref.removeprefix("#/components/schemas/")][
+            "properties"
+        ]
+    ) == {"kind", "name"}
+
+
+# @lat: [[tests#Pydantic responses and OpenAPI#Response serialization schema mode]]
+def test_pydantic_openapi_response_serialization_mode():
+    from pydantic import BaseModel, Field, field_serializer
+
+    class User(BaseModel):
+        display_name: str = Field(alias="displayName")
+        score: int
+
+        @field_serializer("score")
+        def serialize_score(self, value: int) -> str:
+            return f"{value}pts"
+
+    def create_user(user: User) -> User:
+        return user
+
+    def batch_users(users: Annotated[list[User], Body()]) -> list[User]:
+        return users
+
+    app = Haumea()
+    app.add_route("/user", create_user, methods=["POST"])
+    app.add_route("/users", batch_users, methods=["POST"])
+    client = make_client(app)
+
+    http_res = client("POST", "/user", json={"displayName": "Ada", "score": 42})
+    assert http_res.status_code == 200
+    assert http_res.json() == {"display_name": "Ada", "score": "42pts"}
+
+    doc = client("GET", "/openapi.json").json()
+    user_op = doc["paths"]["/user"]["post"]
+    req_schema = user_op["requestBody"]["content"]["application/json"]["schema"]
+    resp_schema = user_op["responses"]["200"]["content"]["application/json"]["schema"]
+
+    assert set(req_schema["properties"]) == {"displayName", "score"}
+    assert req_schema["properties"]["score"]["type"] == "integer"
+    assert set(resp_schema["properties"]) == {"display_name", "score"}
+    assert resp_schema["properties"]["score"]["type"] == "string"
+
+    # When the same model appears as both request and response via $ref,
+    # validation and serialization components stay distinct instead of clobbering.
+    schemas = doc["components"]["schemas"]
+    batch_op = doc["paths"]["/users"]["post"]
+    batch_req_ref = batch_op["requestBody"]["content"]["application/json"]["schema"][
+        "items"
+    ]["$ref"]
+    batch_resp_ref = batch_op["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]["items"]["$ref"]
+    assert batch_req_ref != batch_resp_ref
+    batch_req = schemas[batch_req_ref.removeprefix("#/components/schemas/")]
+    batch_resp = schemas[batch_resp_ref.removeprefix("#/components/schemas/")]
+    assert set(batch_req["properties"]) == {"displayName", "score"}
+    assert batch_req["properties"]["score"]["type"] == "integer"
+    assert set(batch_resp["properties"]) == {"display_name", "score"}
+    assert batch_resp["properties"]["score"]["type"] == "string"
+
+    # ConfigDict(serialize_by_alias=True) keeps alias keys in both HTTP JSON
+    # and the OpenAPI response schema.
+    from pydantic import ConfigDict
+
+    class Aliased(BaseModel):
+        model_config = ConfigDict(serialize_by_alias=True)
+        key_name: str = Field(alias="keyName")
+
+    def echo_aliased(item: Aliased) -> Aliased:
+        return item
+
+    alias_app = Haumea()
+    alias_app.add_route("/aliased", echo_aliased, methods=["POST"])
+    alias_client = make_client(alias_app)
+
+    alias_http = alias_client("POST", "/aliased", json={"keyName": "example"})
+    assert alias_http.status_code == 200
+    assert alias_http.json() == {"keyName": "example"}
+
+    alias_doc = alias_client("GET", "/openapi.json").json()
+    alias_resp = alias_doc["paths"]["/aliased"]["post"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert set(alias_resp["properties"]) == {"keyName"}
+
+    # Mixed models honor each model's own serialize_by_alias config per model.
+    class Plain(BaseModel):
+        key_name: str = Field(alias="keyName")
+
+    class ChildAliased(BaseModel):
+        model_config = ConfigDict(serialize_by_alias=True)
+        other_key: str = Field(alias="otherKey")
+
+    class Parent(BaseModel):
+        parent_key: str = Field(alias="parentKey")
+        child: ChildAliased
+        trailing_key: str = Field(alias="trailingKey")
+
+    def get_parent() -> Parent:
+        return Parent(
+            parentKey="p",
+            child=ChildAliased(otherKey="c"),
+            trailingKey="t",
+        )
+
+    def get_pair() -> tuple[Plain, ChildAliased]:
+        return (Plain(keyName="x"), ChildAliased(otherKey="y"))
+
+    mixed_app = Haumea()
+    mixed_app.add_route("/parent", get_parent, methods=["GET"])
+    mixed_app.add_route("/pair", get_pair, methods=["GET"])
+    mixed_client = make_client(mixed_app)
+
+    assert mixed_client("GET", "/parent").json() == {
+        "parent_key": "p",
+        "child": {"otherKey": "c"},
+        "trailing_key": "t",
+    }
+    assert mixed_client("GET", "/pair").json() == [
+        {"key_name": "x"},
+        {"otherKey": "y"},
+    ]
+
+    mixed_doc = mixed_client("GET", "/openapi.json").json()
+    mixed_schemas = mixed_doc["components"]["schemas"]
+
+    parent_resp = mixed_doc["paths"]["/parent"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert set(parent_resp["properties"]) == {"parent_key", "child", "trailing_key"}
+    child_ref = parent_resp["properties"]["child"]["$ref"].removeprefix(
+        "#/components/schemas/"
+    )
+    assert set(mixed_schemas[child_ref]["properties"]) == {"otherKey"}
+
+    pair_resp = mixed_doc["paths"]["/pair"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    plain_ref, aliased_ref = (
+        entry["$ref"].removeprefix("#/components/schemas/")
+        for entry in pair_resp["prefixItems"]
+    )
+    assert set(mixed_schemas[plain_ref]["properties"]) == {"key_name"}
+    assert set(mixed_schemas[aliased_ref]["properties"]) == {"otherKey"}

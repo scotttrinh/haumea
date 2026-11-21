@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 import msgspec
 
+from haumea._pydantic import enc_hook as _pydantic_enc_hook
 from haumea.requests import Message, Receive, Send
 
 
@@ -162,12 +163,12 @@ class Response:
 
 
 class JSONResponse(Response):
-    """Serializes Structs, dataclasses, attrs classes, datetimes, etc. as JSON."""
+    """Serializes Structs, dataclasses, attrs, BaseModels, datetimes, etc. as JSON."""
 
     media_type = "application/json"
 
     def render(self, content: Any) -> bytes:
-        return msgspec.json.encode(content)
+        return msgspec.json.encode(content, enc_hook=_pydantic_enc_hook)
 
 
 class HTMLResponse(Response):
@@ -332,7 +333,7 @@ class ServerSentEvent(msgspec.Struct):
         if self.data is not msgspec.UNSET:
             data = self.data
             if not isinstance(data, str):
-                data = msgspec.json.encode(data).decode()
+                data = msgspec.json.encode(data, enc_hook=_pydantic_enc_hook).decode()
             lines.extend(f"data: {line}" for line in re.split(r"\r\n|\r|\n", data))
         return ("\n".join(lines) + "\n\n").encode()
 

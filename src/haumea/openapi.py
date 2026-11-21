@@ -6,10 +6,12 @@ import html
 import inspect
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 
+from haumea._pydantic import json_schema as pydantic_json_schema
+from haumea._pydantic import pydantic_adapter
 from haumea.params import Endpoint, RequestInput
 from haumea.responses import Response
 
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from haumea.app import Haumea
 
 _REF = "#/components/schemas/{name}"
+_PYDANTIC_REF = "#/components/schemas/{model}"
 
 _VALIDATION_ERROR = {
     "description": "Validation Error",
@@ -33,12 +36,79 @@ _VALIDATION_ERROR = {
 }
 
 
-def _schema(annotation: Any, components: dict[str, Any]) -> dict[str, Any]:
+def _rewrite_refs(node: Any, renames: dict[str, str]) -> Any:
+    if isinstance(node, dict):
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str) and value in renames:
+                result[key] = renames[value]
+            elif key == "discriminator" and isinstance(value, dict):
+                disc = _rewrite_refs(value, renames)
+                if isinstance(mapping := disc.get("mapping"), dict):
+                    disc["mapping"] = {
+                        k: renames.get(v, v) if isinstance(v, str) else v
+                        for k, v in mapping.items()
+                    }
+                result[key] = disc
+            else:
+                result[key] = _rewrite_refs(value, renames)
+        return result
+    if isinstance(node, list):
+        return [_rewrite_refs(item, renames) for item in node]
+    return node
+
+
+def _merge_components(
+    schema: dict[str, Any],
+    definitions: dict[str, Any],
+    components: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge ``definitions`` into ``components`` without overwriting distinct
+    same-named schemas, rewriting ``$ref`` targets when a suffix is allocated."""
+    if not definitions:
+        return schema
+
+    name_map = {name: name for name in definitions}
+    reserved = set(components) | set(definitions)
+    while True:
+        renames = {
+            f"#/components/schemas/{old}": f"#/components/schemas/{new}"
+            for old, new in name_map.items()
+            if old != new
+        }
+        rewritten = {
+            name_map[old]: _rewrite_refs(def_schema, renames)
+            for old, def_schema in definitions.items()
+        }
+        changed = False
+        for old, current in list(name_map.items()):
+            if current in components and components[current] != rewritten[current]:
+                n = 2
+                while f"{old}_{n}" in reserved:
+                    n += 1
+                fresh = f"{old}_{n}"
+                reserved.add(fresh)
+                name_map[old] = fresh
+                changed = True
+        if not changed:
+            components.update(rewritten)
+            return _rewrite_refs(schema, renames)
+
+
+def _schema(
+    annotation: Any,
+    components: dict[str, Any],
+    *,
+    mode: Literal["validation", "serialization"] = "validation",
+) -> dict[str, Any]:
+    if (adapter := pydantic_adapter(annotation)) is not None:
+        schema = pydantic_json_schema(adapter, ref_template=_PYDANTIC_REF, mode=mode)
+        defs = schema.pop("$defs", None) or {}
+        return _merge_components(schema, defs, components)
     (schema,), definitions = msgspec.json.schema_components(
         [annotation], ref_template=_REF
     )
-    components.update(definitions)
-    return schema
+    return _merge_components(schema, definitions, components)
 
 
 def _input_schema(
@@ -111,7 +181,9 @@ def _operation(
     is_response = isinstance(returns, type) and issubclass(returns, Response)
     if returns not in (inspect.Signature.empty, None) and not is_response:
         success["content"] = {
-            "application/json": {"schema": _schema(returns, components)}
+            "application/json": {
+                "schema": _schema(returns, components, mode="serialization")
+            }
         }
     responses: dict[int, Any] = {200: success}
     if fields:
